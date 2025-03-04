@@ -1,5 +1,6 @@
 import sympy as sp
 from typing import Union, TypeVar
+from numbers import Number
 
 
 
