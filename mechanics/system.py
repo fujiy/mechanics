@@ -1,12 +1,16 @@
-from typing import Union, Any, Optional, cast
+from typing import Union, Any, Optional, Literal, cast, overload
+from collections import defaultdict
+from pprint import pprint
 import sympy as sp
 from sympy.core.cache import cacheit
 import sympy.core.function as spf
 import sympy.core.containers as spc
 from sympy.printing.latex import LatexPrinter
-from mechanics.util import name_type, expr_type, make_symbol, python_name, to_tuple, tuple_ish
-from mechanics.symbol import BaseSpace, Index, Symbol, Variable, Definition, Equation
-from mechanics.space import R
+import matplotlib.pyplot as plt
+
+from .util import name_type, expr_type, make_symbol, python_name, to_tuple, tuple_ish
+from .symbol import BaseSpace, Index, Symbol, Variable, Definition, Equation
+from .space import R
 
 class System:
     _base_space:  dict[str, BaseSpace]
@@ -18,9 +22,6 @@ class System:
     _dict:        dict[str, Any]
     _builtins:    dict[str, Any]
 
-    _discrete_space: dict[Index, BaseSpace]
-    _dicrete_diffs:  dict[BaseSpace, dict[Symbol, tuple[Symbol, int]]]
-
     def __init__(self, space: Optional[name_type] = 't'):
 
         self._base_space  = {}
@@ -31,8 +32,6 @@ class System:
         self._definitions = {}
         self._equations   = {}
         self._dict = {}
-        self._discrete_space = {}
-        self._dicrete_diffs = {}
 
         self._builtins = { k: getattr(sp, k) for k in dir(sp) if not k.startswith('_') }\
                        | { 'diff': self.diff }
@@ -57,11 +56,11 @@ class System:
             # if min is None:
             #     min_ = self.__add_variable(f'{symbol.name}_0', base_space=())[0]
             # else:
-            #     min_ = self(min, must_be_single=True)
+            #     min_ = self(min, return_as_tuple=False)
             # if max is None:
             #     max_ = self.__add_variable(f'{symbol.name}_1', base_space=())[0]
             # else:
-            #     max_ = self(max, must_be_single=True)
+            #     max_ = self(max, return_as_tuple=False)
 
             if diff_notation is not None:
                 if isinstance(diff_notation, dict):
@@ -80,7 +79,7 @@ class System:
     def add_index(self, name: name_type, min: expr_type, max: expr_type) -> 'System':
         symbols = make_symbol(name)
         for symbol in symbols: 
-            index = Index(symbol.name, self(min, must_be_single=True), self(max, must_be_single=True))
+            index = Index(symbol.name, self(min, return_as_tuple=False), self(max, return_as_tuple=False))
             self._indices.update({ symbol.name: index })
             self.__register(symbol.name, index)
         return self
@@ -112,7 +111,7 @@ class System:
                index: Optional[expr_type] = None,
                **options) -> 'System':
         symbols = make_symbol(name, **options)
-        exprs = self(expr, always_tuple=True, **options)
+        exprs = self(expr, return_as_tuple=True, **options)
         if isinstance(condition, tuple):
             condition_ = sp.Eq(self(condition[0]), self(condition[1]))
         elif condition == sp.true:
@@ -122,7 +121,7 @@ class System:
         if len(symbols) != len(exprs): 
             raise ValueError(f'Number of names and exprs must be the same, {({len(symbols)})} vs {({len(exprs)})}')
         if index:
-            index_ = self(index, always_tuple=True)
+            index_ = self(index, return_as_tuple=True)
         else:
             index_ = tuple()
 
@@ -130,7 +129,10 @@ class System:
             base_space = self.base_space_of(expr)
             index__ = index_ + self.free_index_of(expr)
             if symbol.name in self._dict:
-                self._definitions[symbol.name].add_definition(definition=cast(sp.Expr, expr), condition=condition_)
+                try:
+                    self._definitions[symbol.name].add_definition(definition=cast(sp.Expr, expr), condition=condition_)
+                except Exception as e:
+                    raise ValueError(f'Error while adding definition: {symbol.name}') from e
             else:
                 func = Definition.make(symbol.name, index=index__, base_space=base_space,
                                        expr=cast(sp.Expr, expr), condition=condition_)
@@ -141,8 +143,8 @@ class System:
     
     def equate(self, expr: expr_type, rhs: expr_type = sp.S.Zero, label: str = '') -> 'System':
 
-        expr = cast(tuple[sp.Expr, ...], self(expr, always_tuple=True))
-        rhs  = cast(tuple[sp.Expr, ...], self(rhs, always_tuple=True))
+        expr = cast(tuple[sp.Expr, ...], self(expr, return_as_tuple=True))
+        rhs  = cast(tuple[sp.Expr, ...], self(rhs, return_as_tuple=True))
         if len(rhs) == 1: rhs = rhs * len(expr)
         if len(expr) != len(rhs): 
             raise ValueError(f'Number of lhs and rhs must be the same, {({len(expr)})} vs {({len(rhs)})}')
@@ -157,6 +159,8 @@ class System:
         
         equations = {} 
         for expr, rhs, l in zip(expr, rhs, label_):
+            if l in self._equations:
+                raise ValueError(f'Equation \'{l}\' already exists')
             equation = cast(Equation, Equation(expr, rhs))
             equation._label = l
             self.__register(l, equation)
@@ -178,8 +182,8 @@ class System:
         -> tuple[Variable, ...]:
         options = { 'real': True } | options
         if base_space is None: base_space_ = tuple(self._base_space.values())
-        else:                  base_space_ = self(base_space, always_tuple=True)
-        index_ = (index and self(index, always_tuple=True)) or ()
+        else:                  base_space_ = self(base_space, return_as_tuple=True)
+        index_ = (index and self(index, return_as_tuple=True)) or ()
         symbols = make_symbol(name, **options)
         variables = tuple(Variable.make(symbol.name, index=index_, base_space=base_space_, space=space) 
                           for symbol in symbols)
@@ -190,8 +194,8 @@ class System:
     # Advanced declaration
         
     def euler_lagrange_equation(self, L: expr_type, time_var='t', label='EL') -> 'System':
-        L_ = self(L, must_be_single=True)
-        time_var = self(time_var, must_be_single=True)
+        L_ = self(L, return_as_tuple=False)
+        time_var = self(time_var, return_as_tuple=False)
 
         equations: list[sp.Expr] = []
 
@@ -210,9 +214,25 @@ class System:
         return self
     
     # Get info
+
+    def state_space(self, time: Optional[name_type] = None) -> tuple[sp.Expr, ...]:
+        if time is None:
+            time_ = self.base_space[0]
+        else:
+            time_ = cast(BaseSpace, self(time, return_as_tuple=False))
+        
+        X = []
+        for q in self.coordinates:
+            if time_ in q.base_space:
+                X.append(q)
+        for q in self.coordinates:
+            if time_ in q.base_space:
+                X.append(sp.diff(q, time_))
+
+        return tuple(X)
     
     def base_space_of(self, expr: expr_type) -> tuple[BaseSpace, ...]:
-        exprs = self(expr, always_tuple=True, simplify=False)
+        exprs = self(expr, return_as_tuple=True, simplify=False)
         base_space = set().union(*[self.__base_space_of(expr) for expr in exprs])
         return tuple( s for s in self._base_space.values() if s in base_space )
 
@@ -230,7 +250,7 @@ class System:
         return set(base_space)
     
     def free_index_of(self, expr: expr_type) -> tuple[Index, ...]:
-        exprs = self(expr, always_tuple=True, simplify=False)
+        exprs = self(expr, return_as_tuple=True, simplify=False)
         free_index = set().union(*[self.__free_index_of(expr) for expr in exprs])
         return tuple( i for i in self._indices.values() if i in free_index )
     
@@ -248,7 +268,7 @@ class System:
         return set(free_index)
     
     def is_constant(self, expr: expr_type) -> bool:
-        exprs = self(expr, always_tuple=True, simplify=False)
+        exprs = self(expr, return_as_tuple=True, simplify=False)
         result = True
         for expr in exprs: #type:ignore
             if isinstance(expr, Variable):
@@ -256,6 +276,9 @@ class System:
                     (expr.index and [i for i in expr.index if i.name in self._indices]):
                     result = False
                     break
+            else:
+                result = False
+                break
         return result
 
     # Access
@@ -269,15 +292,45 @@ class System:
         if name in self._dict: return self._dict[name]
         else:                  raise KeyError(f'\'{name}\' is not exists')
 
-    def __contains__(self, name: str) -> bool:
+    def __contains__(self, name: name_type) -> bool:
         name = python_name(name)
         return name in self._dict
         
+    @overload
+    def __call__(self, expr: expr_type, 
+                 *,
+                 return_as_tuple: Literal[True],
+                 sum_for: Optional[name_type] = None,
+                 simplify=True, evaluate=False, evaluate_top_level=True,
+                 ) \
+        -> tuple[sp.Basic, ...]:
+        pass
+
+    @overload
+    def __call__(self, expr: expr_type, 
+                 *,
+                 return_as_tuple: Literal[False],
+                 sum_for: Optional[name_type] = None,
+                 simplify=True, evaluate=False, evaluate_top_level=True,
+                 ) \
+        -> sp.Basic:
+        pass
+
+    @overload
+    def __call__(self, expr: expr_type, 
+                 *,
+                 sum_for: Optional[name_type] = None,
+                 simplify=True, evaluate=False, evaluate_top_level=True,
+                 ) \
+        -> sp.Basic:
+        pass
+
     # @cacheit
     def __call__(self, expr: expr_type, 
-                 sum_for: Optional[name_type]=None,
+                 *,
+                 return_as_tuple: Optional[bool] = None,
+                 sum_for: Optional[name_type] = None,
                  simplify=True, evaluate=False, evaluate_top_level=True,
-                 always_tuple=False, must_be_single=False, 
                  ) \
         -> Union[sp.Basic, tuple[sp.Basic, ...]]:
         expr_: Union[sp.Basic, tuple[sp.Basic, ...]]
@@ -286,7 +339,7 @@ class System:
         else:
             expr_ = expr
         if sum_for:
-            index = cast(Index, self(sum_for, must_be_single=True))
+            index = cast(Index, self(sum_for, return_as_tuple=True))
             if index.name not in self._indices:
                 raise ValueError(f'Index \'{index.name}\' is not exists')
             expr_ = sp.summation(expr_, (index, index.min, index.max))
@@ -303,9 +356,9 @@ class System:
                 expr_ = tuple(sp.simplify(e) for e in expr_)
             else:
                 expr_ = sp.simplify(expr_)
-        if always_tuple and not isinstance(expr_, tuple):
+        if return_as_tuple == True and not isinstance(expr_, tuple):
             expr_ = (expr_,)
-        if must_be_single and len(to_tuple(expr_)) != 1: 
+        if return_as_tuple == False and len(to_tuple(expr_)) != 1: 
             raise ValueError(f'Expression must be a single expression: {expr_}')
         return expr_
     
@@ -337,13 +390,17 @@ class System:
 
     # Discretization
 
-    def discretize(self, index: name_type, 
+    def discretization(self) -> 'System':
+        from mechanics.discretization import DiscretizedSystem
+        return DiscretizedSystem(self)
+
+    def __discretize(self, index: name_type, 
                    space: Union[name_type, tuple_ish[BaseSpace], None] = None,
                    step: Optional[expr_type] = None,
                    ) -> 'System':
-        index_ = cast(Index, self(index, must_be_single=True))
+        index_ = cast(Index, self(index, return_as_tuple=False))
         if space is None: space_ = tuple(self._base_space.values())[0]
-        else: space_ = cast(BaseSpace, self(space, must_be_single=True))
+        else: space_ = cast(BaseSpace, self(space, return_as_tuple=False))
         
         system = System(space=None)
         system._discrete_space = { index_: space_ }
@@ -402,7 +459,7 @@ class System:
         for s in self._base_space.values():
             if s == space_:
                 if step:
-                    system.define(s.name, self(step, must_be_single=True) * index_, index=index_)
+                    system.define(s.name, self(step, return_as_tuple=False) * index_, index=index_) #type:ignore
                 else:
                     system.add_variable(s.name, index=index_)
             else: 
@@ -431,28 +488,20 @@ class System:
                           label=eq.label)
 
         return system
-
-    def apply_integrator(self, integrator: 'Integrator', index: Optional[Index] = None, 
-                         X: Optional[list[Variable]] = None, 
-                         F: Optional[list[sp.Expr]] = None) -> 'System':
+    
+    def apply_integrator(self, integrator: 'Integrator', 
+                         index: Optional[Index] = None, 
+                         X: Optional[tuple_ish[Variable]] = None, 
+                         F: Optional[tuple_ish[sp.Expr]] = None) -> 'System':
         if index is None:
-            if len(self._discrete_space) == 1:
-                index = list(self._discrete_space.keys())[0]
-            else:
+            index = self.primary_index()
+            if index is None:
                 raise ValueError('Index must be provided')
         space = self._discrete_space[index]
 
         if X is None:
-            qs = []
-            dqs = []
-            for q in self.coordinates:
-                if index in q.index:
-                    qs.append(q)
-                    for dq, (q_, n) in self._dicrete_diffs[space].items():
-                        if q_.name == q.name and n == 1:
-                            dqs.append(cast(Variable, dq))
-            
-            X = qs + dqs
+            X = self.state_space(index)
+        X = to_tuple(X)
 
         if F is None:
             dqs = []
@@ -465,6 +514,7 @@ class System:
                         elif q_.name == q.name and n == 2:
                             ddqs.append(cast(Variable, dq))
             F = dqs + ddqs
+        F = to_tuple(F)
 
         lhs, rhs = zip(*integrator.equation(self, index, X, F))
         self.equate(lhs, rhs, integrator.name)
@@ -474,10 +524,8 @@ class System:
 
     # Solver
     def solver(self):
-        initial_conditions = list(self.constants)
-        
-        print(initial_conditions)
-    
+        from mechanics.solver import Solver
+        return Solver(self)
 
     # Printing
 
@@ -543,16 +591,6 @@ class System:
     def equations(self) -> tuple[Equation, ...]:
         return tuple(self._equations.values())
     
-class Integrator:
-    is_explicit: bool
-    name: str
-
-    def equation(self, q: System, index: Index, X: list[Symbol], F: list[sp.Expr])\
-        -> list[tuple[sp.Expr, sp.Expr]]:
-        raise NotImplementedError('Integrator.equation() is not implemented')
-
-
-
 class LatexPrinterModified(LatexPrinter):
 
     def __init__(self, system) -> None:

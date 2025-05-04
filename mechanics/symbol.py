@@ -197,9 +197,9 @@ class Definition(Symbol):
             return ((self._expr, sp.true),)
         
     @property
-    def dependency(self) -> tuple[Symbol]:
-        return tuple(s for s in self._expr.atoms(spf.AppliedUndef)
-                     if isinstance(s, Symbol)) #type:ignore
+    def dependency(self) -> set[Symbol]:
+        return { s for s in self._expr.atoms(spf.AppliedUndef)
+                if isinstance(s, Symbol) } #type:ignore
     
     @property
     def func(self): #type:ignore
@@ -213,4 +213,10 @@ class Equation(spr.Equality):
     @property
     def label(self) -> str:
         return self._label
+    
+    @property
+    def dependency(self) -> set[Symbol]:
+        return { s for s in self.lhs.atoms(spf.AppliedUndef) 
+                            | self.rhs.atoms(spf.AppliedUndef)
+                if isinstance(s, Symbol) } #type:ignore
     
