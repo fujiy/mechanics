@@ -74,6 +74,12 @@ class System:
             self._base_space.update({ symbol.name: base_space })
             self.__register(symbol.name, base_space)
 
+            if diff_notation_:
+                for n in range(1, 4):
+                    print(python_name(diff_notation_('', n)), base_space, n, self.diff(base_space ** 5, base_space, n))
+                    self._builtins.update({ 
+                        python_name(diff_notation_('', n)): lambda expr, n=n: self.diff(expr, base_space, n)})
+
         return self
     
     def add_index(self, name: name_type, min: expr_type, max: expr_type) -> 'System':
@@ -390,137 +396,9 @@ class System:
 
     # Discretization
 
-    def discretization(self) -> 'System':
+    def discretization(self) -> Any:
         from mechanics.discretization import DiscretizedSystem
         return DiscretizedSystem(self)
-
-    def __discretize(self, index: name_type, 
-                   space: Union[name_type, tuple_ish[BaseSpace], None] = None,
-                   step: Optional[expr_type] = None,
-                   ) -> 'System':
-        index_ = cast(Index, self(index, return_as_tuple=False))
-        if space is None: space_ = tuple(self._base_space.values())[0]
-        else: space_ = cast(BaseSpace, self(space, return_as_tuple=False))
-        
-        system = System(space=None)
-        system._discrete_space = { index_: space_ }
-        system._dicrete_diffs[space_] = {}
-
-        def discretized(symbol: Symbol) -> tuple[tuple[Index, ...], tuple[BaseSpace, ...]]:
-            new_index: list[Index] = list(symbol.index)
-            new_base_space: list[BaseSpace] = []
-            for s in symbol.base_space:
-                if s == space_: new_index.append(index_)
-                else:           new_base_space.append(s)
-            return (tuple(new_index), tuple(new_base_space))
-        
-        def replace_diff(expr: sp.Expr, *args) -> sp.Expr:
-
-            if isinstance(expr, Symbol):
-
-                new_index, new_base_space = discretized(expr)
-
-                diff_n = 0
-                new_args = []
-                for s, n in args:
-                    if s == space_:
-                        diff_n = n
-                    else:
-                        new_args.append((s, n))
-
-                if diff_n == 0: 
-                    return sp.Derivative(expr, *args)
-
-                name = self.latex(sp.Derivative(expr, space_, diff_n))
-
-                if name in self:
-                    var = system[name]
-                else:
-                    system.add_variable(name, index=new_index, base_space=new_base_space, space=expr.space)
-                    var = system[name]
-                    system._dicrete_diffs[space_][cast(Symbol, var)] = (expr, diff_n)
-
-                if len(new_args) == 0:
-                    return var
-                else:
-                    return sp.Derivative(var, *new_args)
-
-            else:
-                raise ValueError(f'Expression must be a symbol, not {type(expr)}')
-            
-        def replace_symbol(symbol: Symbol) -> Symbol:
-            return cast(Symbol, system[symbol.name])
-        
-        def discretize_expr(expr: sp.Expr) -> sp.Expr:
-            return (expr.replace(sp.Derivative, replace_diff) #type:ignore
-                        .replace(lambda x: isinstance(x, spf.AppliedUndef), replace_symbol)) #type:ignore
-
-
-        for s in self._base_space.values():
-            if s == space_:
-                if step:
-                    system.define(s.name, self(step, return_as_tuple=False) * index_, index=index_) #type:ignore
-                else:
-                    system.add_variable(s.name, index=index_)
-            else: 
-                system.add_space(s.name, s.min, s.max)
-
-
-        for i in self._indices.values():
-            system.add_index(i.name, i.min, i.max)
-
-        for q in self.coordinates:
-            new_index, new_base_space = discretized(q)
-            system.add_coordinate(q.name, index=new_index, base_space=new_base_space, space=q.space)
-            replace_diff(q, (space_, 1))
-            replace_diff(q, (space_, 2))
-
-        for v in self._variables.values():
-            new_index, new_base_space = discretized(v)
-            system.add_variable(v.name, index=new_index, base_space=new_base_space, space=v.space)
-
-        for d in self._definitions.values():
-            system.define(d.name, cast(sp.Expr, discretize_expr(d.expr)))
-
-        for eq in self._equations.values():
-            system.equate(discretize_expr(cast(sp.Expr, eq.lhs)), 
-                          discretize_expr(cast(sp.Expr, eq.rhs)), 
-                          label=eq.label)
-
-        return system
-    
-    def apply_integrator(self, integrator: 'Integrator', 
-                         index: Optional[Index] = None, 
-                         X: Optional[tuple_ish[Variable]] = None, 
-                         F: Optional[tuple_ish[sp.Expr]] = None) -> 'System':
-        if index is None:
-            index = self.primary_index()
-            if index is None:
-                raise ValueError('Index must be provided')
-        space = self._discrete_space[index]
-
-        if X is None:
-            X = self.state_space(index)
-        X = to_tuple(X)
-
-        if F is None:
-            dqs = []
-            ddqs = []
-            for q in self.coordinates:
-                if index in q.index:
-                    for dq, (q_, n) in self._dicrete_diffs[space].items():
-                        if q_.name == q.name and n == 1:
-                            dqs.append(cast(Variable, dq))
-                        elif q_.name == q.name and n == 2:
-                            ddqs.append(cast(Variable, dq))
-            F = dqs + ddqs
-        F = to_tuple(F)
-
-        lhs, rhs = zip(*integrator.equation(self, index, X, F))
-        self.equate(lhs, rhs, integrator.name)
-
-        return self
-    
 
     # Solver
     def solver(self):

@@ -1,4 +1,4 @@
-from typing import cast
+from typing import cast, Any
 import numpy as np
 import numpy
 from scipy import linalg
@@ -40,11 +40,11 @@ class Result:
 
     # Access
     
-    def __getattr__(self, name: str) -> sp.Expr:
+    def __getattr__(self, name: str) -> np.ndarray:
         if name in self._dict: return self._dict[name]
         else:                  raise AttributeError(f'\'{name}\' is not exists')
         
-    def __getitem__(self, name: str) -> sp.Expr:
+    def __getitem__(self, name: str) -> np.ndarray:
         name = python_name(name)
         if name in self._dict: return self._dict[name]
         else:                  raise KeyError(f'\'{name}\' is not exists')
@@ -52,6 +52,11 @@ class Result:
     def __contains__(self, name: str) -> bool:
         name = python_name(name)
         return name in self._dict
+    
+    # For plotting
+    def _as_mpl_axes(self) -> Any:
+        from mechanics.plot import ResultAxes
+        return ResultAxes, { 'result': self } 
         
 
 class Solver:
