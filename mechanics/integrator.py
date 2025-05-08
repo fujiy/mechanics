@@ -1,11 +1,10 @@
 from typing import Optional, Union, cast, Callable, Any
 import sympy as sp
 import sympy.core.function as spf
-from mechanics.symbol import Index, Symbol
+from mechanics.util import name_type, expr_type, tuple_ish, to_tuple
+from mechanics.symbol import Index, Function, Equation, BaseSpace
 from mechanics.system import System
 from mechanics.discretization import DiscretizedSystem, Discretizer
-from mechanics.symbol import Variable, Equation, BaseSpace
-from mechanics.util import name_type, expr_type, tuple_ish, to_tuple
 
 class Integrator(Discretizer):
     name: str
@@ -13,8 +12,8 @@ class Integrator(Discretizer):
     system: DiscretizedSystem
     space: BaseSpace
     index: Index
-    X: tuple[Variable, ...]
-    dX: tuple[Variable, ...]
+    X: tuple[Function, ...]
+    dX: tuple[Function, ...]
     X_original: tuple[sp.Expr, ...]
     dX_original: tuple[sp.Expr, ...]
 
@@ -44,9 +43,9 @@ class Integrator(Discretizer):
 
         self.dX_original = tuple(sp.diff(original(x), self.space) for x in self.X_original)
 
-        self.X = tuple(cast(Variable, discretized.discretize_expr(x))
+        self.X = tuple(cast(Function, discretized.discretize_expr(x))
                         for x in self.X_original)
-        self.dX = tuple(cast(Variable, discretized.discretize_expr(x)) 
+        self.dX = tuple(cast(Function, discretized.discretize_expr(x)) 
                         for x in self.dX_original)
         
     def apply_to_equations(self, equations: tuple[Equation, ...]):
@@ -87,7 +86,7 @@ class Integrator(Discretizer):
         raise NotImplementedError('Integrator.step_equations() is not implemented')
 
 
-    def equation(self, index: Index, X: tuple[Symbol, ...], F: tuple[sp.Expr, ...])\
+    def equation(self, index: Index, X: tuple[Function, ...], F: tuple[sp.Expr, ...])\
         -> list[tuple[sp.Expr, sp.Expr]]:
         raise NotImplementedError('Integrator.equation() is not implemented')
 

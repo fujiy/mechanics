@@ -9,35 +9,35 @@ from sympy.printing.latex import LatexPrinter
 import matplotlib.pyplot as plt
 
 from .util import name_type, expr_type, make_symbol, python_name, to_tuple, tuple_ish
-from .symbol import BaseSpace, Index, Symbol, Variable, Definition, Equation
+from .symbol import BaseSpace, Index, Expr, Function, Equation, Space
 from .space import R
 
 class System:
-    _base_space:  dict[str, BaseSpace]
-    _indices:     dict[str, Index]
-    _coordinates: dict[str, Variable]
-    _variables:   dict[str, Variable]
-    _definitions: dict[str, Definition]
-    _equations:   dict[str, Equation]
-    _dict:        dict[str, Any]
     _builtins:    dict[str, Any]
+    _dict:        dict[str, Any]
+
+    _base_space:  list[BaseSpace]
+    _indices:     list[Index]
+    _coordinates: list[Function]
+    _functions:   list[Function]
+    _definitions: dict[str, Expr]
+    _equations:   dict[str, Equation]
 
     def __init__(self, space: Optional[name_type] = 't'):
+        
 
-        self._base_space  = {}
-        self._indices     = {}
-        self._coordinates = {}
-        self._velocities  = {}
-        self._variables   = {}
-        self._definitions = {}
-        self._equations   = {}
         self._dict = {}
-
         self._builtins = { k: getattr(sp, k) for k in dir(sp) if not k.startswith('_') }\
                        | { 'diff': self.diff }
+
+        self._base_space  = []
+        self._indices     = []
+        self._coordinates = []
+        self._functions   = []
+        self._definitions = {}
+        self._equations   = {}
         
         time_diff_notation = lambda s, n: f'\\{"d" * n}ot{{{s}}}'
-
         if space: self.add_space(space, diff_notation={'t': time_diff_notation})
 
     # Basic declaration
@@ -54,11 +54,11 @@ class System:
         
         for symbol in symbols: 
             # if min is None:
-            #     min_ = self.__add_variable(f'{symbol.name}_0', base_space=())[0]
+            #     min_ = self.__add_function(f'{symbol.name}_0', base_space=())[0]
             # else:
             #     min_ = self(min, return_as_tuple=False)
             # if max is None:
-            #     max_ = self.__add_variable(f'{symbol.name}_1', base_space=())[0]
+            #     max_ = self.__add_function(f'{symbol.name}_1', base_space=())[0]
             # else:
             #     max_ = self(max, return_as_tuple=False)
 
@@ -71,13 +71,12 @@ class System:
                 diff_notation_ = None
 
             base_space = BaseSpace(symbol.name, diff_notation=diff_notation_)
-            self._base_space.update({ symbol.name: base_space })
+            self._base_space.append(base_space)
             self.__register(symbol.name, base_space)
 
             if diff_notation_:
-                for n in range(1, 4):
-                    print(python_name(diff_notation_('', n)), base_space, n, self.diff(base_space ** 5, base_space, n))
-                    self._builtins.update({ 
+                for n in range(1, 5):
+                    self._dict.update({ 
                         python_name(diff_notation_('', n)): lambda expr, n=n: self.diff(expr, base_space, n)})
 
         return self
@@ -86,7 +85,7 @@ class System:
         symbols = make_symbol(name)
         for symbol in symbols: 
             index = Index(symbol.name, self(min, return_as_tuple=False), self(max, return_as_tuple=False))
-            self._indices.update({ symbol.name: index })
+            self._indices.append(index)
             self.__register(symbol.name, index)
         return self
 
@@ -95,21 +94,21 @@ class System:
                        base_space: Union[name_type, tuple_ish[BaseSpace], None] = None, 
                        space: expr_type = R, 
                        **options) -> 'System':
-        coordinates = self.__add_variable(name, index=index, base_space=base_space, space=space, **options)
-        self._coordinates.update({ q.name: q for q in coordinates})
+        coordinates = self.__add_function(name, index=index, base_space=base_space, space=space, **options)
+        self._coordinates.extend(coordinates)
         return self
     
     def add_variable(self, name: name_type, 
                      index: Union[name_type, tuple_ish[Index], None] = None,
                      base_space: Union[name_type, tuple_ish[BaseSpace], None] = None, 
                      space: expr_type = R, **options) -> 'System':
-        self.__add_variable(name, index=index, base_space=base_space, space=space, **options)
+        self.__add_function(name, index=index, base_space=base_space, space=space, **options)
         return self
     
     def add_constant(self, name: name_type,
                      index: Union[name_type, tuple_ish[Index], None] = None,
                      **options) -> 'System':
-        self.__add_variable(name, index=index, base_space=(), **options)
+        self.__add_function(name, index=index, base_space=(), **options)
         return self
 
     def define(self, name: name_type, expr: expr_type, 
@@ -117,7 +116,7 @@ class System:
                index: Optional[expr_type] = None,
                **options) -> 'System':
         symbols = make_symbol(name, **options)
-        exprs = self(expr, return_as_tuple=True, **options)
+        exprs = cast(tuple[Expr, ...], self(expr, return_as_tuple=True, **options))
         if isinstance(condition, tuple):
             condition_ = sp.Eq(self(condition[0]), self(condition[1]))
         elif condition == sp.true:
@@ -128,29 +127,51 @@ class System:
             raise ValueError(f'Number of names and exprs must be the same, {({len(symbols)})} vs {({len(exprs)})}')
         if index:
             index_ = self(index, return_as_tuple=True)
+            if any([i not in self._indices for i in index_]):
+                raise ValueError(f'Index \'{index}\' is not exists')
+            index_ = cast(tuple[Index], index_)
         else:
             index_ = tuple()
 
         for symbol, expr in zip(symbols, exprs):
             base_space = self.base_space_of(expr)
             index__ = index_ + self.free_index_of(expr)
-            if symbol.name in self._dict:
-                try:
-                    self._definitions[symbol.name].add_definition(definition=cast(sp.Expr, expr), condition=condition_)
-                except Exception as e:
-                    raise ValueError(f'Error while adding definition: {symbol.name}') from e
+
+            if symbol.name in self.definitions:
+                func = self[symbol.name]
+                if not isinstance(func, Function):
+                    raise ValueError(f'Name \'{symbol.name}\' is not a function')
+                func = cast(Function, func)
+                if func.index != index__:
+                    raise ValueError(f'Index of \'{symbol.name}\' is not the same')
+                if func.base_space != base_space:
+                    raise ValueError(f'Base space of \'{symbol.name}\' is not the same')
+
+                definition = self._definitions[symbol.name]
+                if isinstance(definition, sp.Piecewise):
+                    cases = cast(list[tuple[sp.Expr, sp.Basic]], definition.args)
+                else:
+                    cases = [(definition, sp.true)]
+
+                if condition in [ case[1] for case in cases ]:
+                    raise ValueError(f'Function definition already exists for given condition: {condition}')
+                cases.append((expr, condition_))
+
+                print(symbol.name, cases)
+
+                self._definitions[symbol.name] = sp.Piecewise(*cases)
+
             else:
-                func = Definition.make(symbol.name, index=index__, base_space=base_space,
-                                       expr=cast(sp.Expr, expr), condition=condition_)
+                func = self.__add_function(symbol.name, index=index__, base_space=base_space, space=R, **options)[0]
                 self.__register(symbol.name, func)
-                self._definitions.update({symbol.name: func})
+                self._definitions[symbol.name] = expr
 
         return self
     
     def equate(self, expr: expr_type, rhs: expr_type = sp.S.Zero, label: str = '') -> 'System':
 
-        expr = cast(tuple[sp.Expr, ...], self(expr, return_as_tuple=True))
-        rhs  = cast(tuple[sp.Expr, ...], self(rhs, return_as_tuple=True))
+        expr = cast(tuple[Expr, ...], self(expr, return_as_tuple=True))
+        rhs  = cast(tuple[Expr, ...], self(rhs, return_as_tuple=True))
         if len(rhs) == 1: rhs = rhs * len(expr)
         if len(expr) != len(rhs): 
             raise ValueError(f'Number of lhs and rhs must be the same, {({len(expr)})} vs {({len(rhs)})}')
@@ -181,33 +202,34 @@ class System:
             raise ValueError(f'Name \'{name}\' already exists')
         self._dict[name] = expr
 
-    def __add_variable(self, name: name_type,
+    def __add_function(self, name: name_type,
                         index: Union[name_type, tuple_ish[Index], None] = None,
                         base_space: Union[name_type, tuple_ish[BaseSpace], None] = None, 
-                        space: expr_type = R, **options) \
-        -> tuple[Variable, ...]:
+                        space: Space = R, **options) \
+        -> tuple[Function, ...]:
         options = { 'real': True } | options
-        if base_space is None: base_space_ = tuple(self._base_space.values())
-        else:                  base_space_ = self(base_space, return_as_tuple=True)
-        index_ = (index and self(index, return_as_tuple=True)) or ()
+        if base_space is None: base_space_ = tuple(self._base_space)
+        else:                  base_space_ = cast(tuple[BaseSpace, ...], self(base_space, return_as_tuple=True))
+        index_ = (index and cast(tuple[Index, ...], self(index, return_as_tuple=True))) or tuple()
         symbols = make_symbol(name, **options)
-        variables = tuple(Variable.make(symbol.name, index=index_, base_space=base_space_, space=space) 
+        functions = tuple(Function.make(symbol.name, index=index_, base_space=base_space_, space=space) 
                           for symbol in symbols)
-        for var in variables: self.__register(var.name, var) #type:ignore
-        self._variables.update({ var.name: var for var in variables })
-        return variables
+        for func in functions: self.__register(func.name, func) #type:ignore
+        self._functions.extend(functions)
+        return functions
     
     # Advanced declaration
         
     def euler_lagrange_equation(self, L: expr_type, time_var='t', label='EL') -> 'System':
-        L_ = self(L, return_as_tuple=False)
+        L_ = self(L, evaluate=True, return_as_tuple=False)
         time_var = self(time_var, return_as_tuple=False)
 
-        equations: list[sp.Expr] = []
+        equations: list[Expr] = []
 
         for q in self.coordinates:
             dLdq = self.diff(L_, q)
             equation = dLdq
+
             for s in self.base_space:
                 dLddq = self.diff(L_, self.diff(q, s))
                 d_dLddq_ds = self.diff(dLddq, s)
@@ -215,13 +237,15 @@ class System:
 
             equations.append(equation)
 
+
+
         self.equate(tuple(equations), label=label)
 
         return self
     
     # Get info
 
-    def state_space(self, time: Optional[name_type] = None) -> tuple[sp.Expr, ...]:
+    def state_space(self, time: Optional[name_type] = None) -> tuple[Expr, ...]:
         if time is None:
             time_ = self.base_space[0]
         else:
@@ -240,46 +264,44 @@ class System:
     def base_space_of(self, expr: expr_type) -> tuple[BaseSpace, ...]:
         exprs = self(expr, return_as_tuple=True, simplify=False)
         base_space = set().union(*[self.__base_space_of(expr) for expr in exprs])
-        return tuple( s for s in self._base_space.values() if s in base_space )
+        return tuple( s for s in self._base_space if s in base_space )
 
     def __base_space_of(self, expr: sp.Basic) -> set[BaseSpace]:
         base_space = []
         for symbol in expr.atoms(sp.Symbol):
-            if symbol.name in self._base_space:
-                base_space.append(self._base_space[symbol.name])
+            if symbol in self._base_space:
+                base_space.append(symbol)
         for f in expr.atoms(spf.AppliedUndef):
-            name = getattr(f, 'name', None)
-            if name in self._variables: 
-                base_space.extend(self._variables[name].base_space)
-            elif name in self._definitions:
-                base_space.extend(self._definitions[name].base_space)
+            if f in self._functions: 
+                base_space.extend(f.base_space)
         return set(base_space)
     
     def free_index_of(self, expr: expr_type) -> tuple[Index, ...]:
         exprs = self(expr, return_as_tuple=True, simplify=False)
         free_index = set().union(*[self.__free_index_of(expr) for expr in exprs])
-        return tuple( i for i in self._indices.values() if i in free_index )
+        return tuple( i for i in self._indices if i in free_index )
     
     def __free_index_of(self, expr: sp.Basic) -> set[Index]:
         free_index = []
         for symbol in expr.atoms(sp.Symbol):
-            if symbol.name in self._indices:
-                free_index.append(self._indices[symbol.name])
+            if symbol in self._indices:
+                free_index.append(symbol)
         for f in expr.atoms(spf.AppliedUndef):
-            name = getattr(f, 'name', None)
-            if name in self._variables: 
-                free_index.extend(self._variables[name].free_index)
-            elif name in self._definitions:
-                free_index.extend(self._definitions[name].free_index)
+            if f in self._functions: 
+                free_index.extend(f.free_index)
         return set(free_index)
+    
+    def dependencies_of(self, expr: Union[Expr, Equation]) -> set[Function]:
+        return { s for s in expr.atoms(spf.AppliedUndef)
+                  if isinstance(s, Function) }
     
     def is_constant(self, expr: expr_type) -> bool:
         exprs = self(expr, return_as_tuple=True, simplify=False)
         result = True
         for expr in exprs: #type:ignore
-            if isinstance(expr, Variable):
+            if isinstance(expr, Function):
                 if expr.base_space or\
-                    (expr.index and [i for i in expr.index if i.name in self._indices]):
+                    (expr.index and [i for i in expr.index if i in self._indices]):
                     result = False
                     break
             else:
@@ -289,11 +311,11 @@ class System:
 
     # Access
     
-    def __getattr__(self, name: str) -> sp.Expr:
+    def __getattr__(self, name: str) -> Expr:
         if name in self._dict: return self._dict[name]
         else:                  raise AttributeError(f'\'{name}\' is not exists')
         
-    def __getitem__(self, name: str) -> sp.Expr:
+    def __getitem__(self, name: str) -> Expr:
         name = python_name(name)
         if name in self._dict: return self._dict[name]
         else:                  raise KeyError(f'\'{name}\' is not exists')
@@ -345,12 +367,12 @@ class System:
         else:
             expr_ = expr
         if sum_for:
-            index = cast(Index, self(sum_for, return_as_tuple=True))
+            index = cast(Index, self(sum_for, return_as_tuple=False))
             if index.name not in self._indices:
                 raise ValueError(f'Index \'{index.name}\' is not exists')
             expr_ = sp.summation(expr_, (index, index.min, index.max))
         if evaluate_top_level and getattr(expr_, '_is_definition', False): 
-            expr_ = expr_.expr #type:ignore
+            expr_ = expr_.single_expr #type:ignore
         if evaluate:              
             expr_ = self.eval(expr_) #type:ignore
         if isinstance(expr_, spc.Tuple): 
@@ -382,13 +404,13 @@ class System:
         evaluated = {}
         for f in expr_.atoms(spf.AppliedUndef):
             if f.name in self._definitions and f not in recursive:
-                evaluated[f] = self.__eval(f.expr, recursive | set([f]))
+                evaluated[f] = self.__eval(self._definitions[f.name], recursive | set([f]))
 
         return cast(sp.Basic, expr_.subs(evaluated))
     
 
-    # @cacheit
-    def diff(self, expr, *args, **kwargs) -> sp.Expr:
+    @cacheit
+    def diff(self, expr, *args, **kwargs) -> Expr:
         return sp.diff(self.eval(expr), 
                        *[self(a, evaluate_top_level=False) for a in args],
                        **kwargs)
@@ -408,8 +430,13 @@ class System:
     # Printing
 
     def latex(self, expr: expr_type, **options) -> str:
-        expr_ = self(expr, evaluate_top_level=False, **options)
+        expr_ = self(expr, evaluate_top_level=False, simplify=False, **options)
         return LatexPrinterModified(self).doprint(expr_)
+    
+    def show(self, expr: expr_type, **options):
+        from IPython.display import display, Math
+        expr_ = self(expr, **options)
+        display(Math(self.latex(expr_)))
 
     def show_all(self) -> 'System':
         from IPython.display import display, Math #type:ignore
@@ -419,55 +446,66 @@ class System:
         else:
             coords = '(' + ', '.join([ self.latex(q) for q in self.coordinates ]) + ')'
         display(Math('Q = ' + self.configuration + r' \ni ' + coords))
-        display(Math(r'\mathrm{constants}: ' 
-                     + ', '.join([ self.latex(c) for c in self.constants ])))
-        display(Math(r'\mathrm{variables}: '
-                        + ', '.join([ self.latex(v) for v in self.variables ])))
-        display(Math(r'\mathrm{definitions}:'))
-        for f in self.definitions:
-            display(Math(f'{self.latex(f)} = {self.latex(f.expr)}'))
-        display(Math(r'\mathrm{equations}:'))
-        for eq in self.equations:
-            display(Math(f'\mathrm{{{eq.label}}}: {self.latex(eq.lhs)} = {self.latex(eq.rhs)}'))
+
+        if self.constants:
+            display(Math(r'\mathrm{constants}: ' 
+                         + ', '.join([ self.latex(c) for c in self.constants ])))
+
+        if self.variables:
+            display(Math(r'\mathrm{variables}: '
+                            + ', '.join([ self.latex(v) for v in self.variables ])))
+
+        if self.definitions:
+            display(Math(r'\mathrm{definitions}:'))
+            for f, definition in self.definitions.items():
+                display(Math(f'{self.latex(f)} = {self.latex(definition)}'))
+
+        if self.equations:
+            display(Math(r'\mathrm{equations}:'))
+            for label, eq in self.equations.items():
+                display(Math(f'\mathrm{{{label}}}: {self.latex(eq.lhs)} = {self.latex(eq.rhs)}'))
 
         return self
     
     # Properties
 
     @property
-    def base_space(self) -> tuple[sp.Symbol, ...]:
-        return tuple(self._base_space.values())
+    def base_space(self) -> tuple[BaseSpace, ...]:
+        return tuple(self._base_space)
     
     @property
     def indices(self) -> tuple[Index, ...]:
-        return tuple(self._indices.values())
+        return tuple(self._indices)
     
     @property
     def configuration(self) -> str:
         return r' \times '.join(
-            [str(q.space) for q in self._coordinates.values()])
+            [str(q.space) for q in self._coordinates])
     
     @property
-    def coordinates(self) -> tuple[Variable, ...]:
-        return tuple(self._coordinates.values())
+    def coordinates(self) -> tuple[Function, ...]:
+        return tuple(self._coordinates)
     
     @property
-    def variables(self) -> tuple[Variable, ...]:
-        return tuple(v for v in self._variables.values()
-                     if not self.is_constant(v) and v.name not in self._coordinates)
+    def variables(self) -> tuple[Function, ...]:
+        return tuple(v for v in self._functions
+                     if not self.is_constant(v) 
+                        and v not in self._coordinates
+                        and v.name not in self._definitions)
     
     @property
-    def constants(self) -> tuple[Variable, ...]:
-        return tuple(v for v in self._variables.values() 
-                     if self.is_constant(v) and v.name not in self._coordinates)
+    def constants(self) -> tuple[Function, ...]:
+        return tuple(v for v in self._functions
+                     if self.is_constant(v) and v not in self._coordinates)
     
     @property
-    def definitions(self) -> tuple[Definition, ...]:
-        return tuple(self._definitions.values())
+    def definitions(self) -> dict[Function, Expr]:
+        return { cast(Function, self(f, return_as_tuple=False)): definition 
+                for f, definition in self._definitions.items() }
     
     @property
-    def equations(self) -> tuple[Equation, ...]:
-        return tuple(self._equations.values())
+    def equations(self) -> dict[str, Equation]:
+        return self._equations
     
 class LatexPrinterModified(LatexPrinter):
 
@@ -475,14 +513,14 @@ class LatexPrinterModified(LatexPrinter):
         super().__init__()
         self._system = system
 
-    def _print_Derivative(self, expr: sp.Expr) -> str:
+    def _print_Derivative(self, expr: Expr) -> str:
 
         notations = []
         no_notations = []
 
         for s, n in expr.args[1:]: #type:ignore
             if isinstance(s, BaseSpace) \
-                and s.name in self._system._base_space \
+                and s in self._system._base_space \
                 and s.diff_notation is not None:
                 notations.append((s.diff_notation, n))
             else:

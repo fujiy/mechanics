@@ -4,7 +4,7 @@ import sympy as sp
 import sympy.core.function as spf
 
 from .system import System
-from .symbol import BaseSpace, Index, Symbol, Variable, Definition, Equation
+from .symbol import BaseSpace, Index, Function, Equation
 from .util import name_type, expr_type, tuple_ish
 
 class DiscretizedSystem(System):
@@ -12,7 +12,7 @@ class DiscretizedSystem(System):
 
 
     _discretized_spaces: dict[BaseSpace, Index]
-    _discretized_diffs:  dict[BaseSpace, dict[Symbol, tuple[Symbol, int]]]
+    _discretized_diffs:  dict[BaseSpace, dict[Function, tuple[Function, int]]]
     _discretizers: list[tuple['Discretizer', dict[str, Any]]]
 
     def __init__(self, system: System):
@@ -29,7 +29,7 @@ class DiscretizedSystem(System):
         self._discretized_diffs = {}
         self._discretizers = []
 
-        for i in self._original._indices.values():
+        for i in self._original._indices:
             self.add_index(i.name, i.min, i.max)
 
     def uniform_space(self, space: name_type, index: name_type, 
@@ -68,9 +68,9 @@ class DiscretizedSystem(System):
             System: The discretized system.
         """
 
-        for s in self._original._base_space.values():
+        for s in self._original.base_space:
             if s not in self._discretized_spaces:
-                self.add_space(s.name, s.min, s.max)
+                self.add_space(s.name)
 
         for q in self._original.coordinates:
             new_index, new_base_space = self.__discretized_args(q)
@@ -80,12 +80,12 @@ class DiscretizedSystem(System):
                 # self.__replace_diff(q, (space_, 1))
                 # self.__replace_diff(q, (space_, 2))
 
-        for v in self._original._variables.values():
+        for v in self._original.variables + self._original.constants:
             new_index, new_base_space = self.__discretized_args(v)
             self.add_variable(v.name, index=new_index, base_space=new_base_space, space=v.space)
 
-        for d in self._original._definitions.values():
-            self.define(d.name, cast(sp.Expr, self.discretize_expr(d.expr)))
+        for name, definition in self._original._definitions.items():
+            self.define(name, cast(sp.Expr, self.discretize_expr(definition)))
 
         for discretizer, options in self._discretizers:
             discretizer.setup(self._original, self, **options)
@@ -100,7 +100,7 @@ class DiscretizedSystem(System):
             
             # if applied: break
             # if not applied:
-            #     self.equate(self.discretize_expr(cast(sp.Expr, eq.lhs)), 
+            #     self.equate(self.discretize_single_expr(cast(sp.Expr, eq.lhs)), 
             #                 self.discretize_expr(cast(sp.Expr, eq.rhs)), 
             #                 label=eq.label)
         
@@ -112,10 +112,10 @@ class DiscretizedSystem(System):
         else:
             return None
         
-    def __discretized_args(self, symbol: Symbol) -> tuple[tuple[Index, ...], tuple[BaseSpace, ...]]:
-        new_index: list[Index] = list(symbol.index)
+    def __discretized_args(self, v: Function) -> tuple[tuple[Index, ...], tuple[BaseSpace, ...]]:
+        new_index: list[Index] = list(v.index)
         new_base_space: list[BaseSpace] = []
-        for s in symbol.base_space:
+        for s in v.base_space:
             if s in self._discretized_spaces: 
                 new_index.append(self._discretized_spaces[s])
             else:           
@@ -123,7 +123,7 @@ class DiscretizedSystem(System):
         return (tuple(new_index), tuple(new_base_space))
     
     def __replace_diff(self, expr: sp.Expr, *args) -> sp.Expr:
-        if not isinstance(expr, Symbol):
+        if not isinstance(expr, Function):
             raise ValueError(f'Expression must be a symbol, not {type(expr)}')
 
         new_index, new_base_space = self.__discretized_args(expr)
@@ -148,7 +148,7 @@ class DiscretizedSystem(System):
             self.add_variable(name, index=new_index, base_space=new_base_space, space=expr.space)
             var = self[name]
             for space_, diff_n in diff_orders.items():
-                self._discretized_diffs[space_][cast(Symbol, var)] = (expr, diff_n)
+                self._discretized_diffs[space_][cast(Function, var)] = (expr, diff_n)
 
         if len(new_args) == 0:
             return var
@@ -157,46 +157,14 @@ class DiscretizedSystem(System):
 
     
     def discretize_expr(self, expr: sp.Basic) -> sp.Expr:
-        def replace_symbol(symbol: Symbol) -> Symbol:
-            return cast(Symbol, self[symbol.name])
+        def replace_symbol(symbol: Function) -> Function:
+            return cast(Function, self[symbol.name])
         return (expr.replace(sp.Derivative, self.__replace_diff) #type:ignore
                     .replace(lambda x: isinstance(x, spf.AppliedUndef), replace_symbol)) #type:ignore
 
-    def apply_integrator(self, integrator: 'Integrator', 
-                         index: Optional[Index] = None, 
-                         X: Optional[tuple_ish[Variable]] = None, 
-                         F: Optional[tuple_ish[sp.Expr]] = None) -> 'System':
-        if index is None:
-            index = self.primary_index()
-            if index is None:
-                raise ValueError('Index must be provided')
-        space = self._discrete_space[index]
-
-        if X is None:
-            X = self.state_space(index)
-        X = to_tuple(X)
-
-        if F is None:
-            dqs = []
-            ddqs = []
-            for q in self.coordinates:
-                if index in q.index:
-                    for dq, (q_, n) in self._dicrete_diffs[space].items():
-                        if q_.name == q.name and n == 1:
-                            dqs.append(cast(Variable, dq))
-                        elif q_.name == q.name and n == 2:
-                            ddqs.append(cast(Variable, dq))
-            F = dqs + ddqs
-        F = to_tuple(F)
-
-        lhs, rhs = zip(*integrator.equation(self, index, X, F))
-        self.equate(lhs, rhs, integrator.name)
-
-        return self
-
     def state_space(self, time: Optional[name_type] = None) -> tuple[sp.Expr, ...]:
         X = self._original.state_space(time or list(self._discretized_spaces.keys())[0])
-        return tuple(cast(Variable, self.discretize_expr(x)) for x in X)
+        return tuple(cast(Function, self.discretize_expr(x)) for x in X)
 
 class Discretizer:
 

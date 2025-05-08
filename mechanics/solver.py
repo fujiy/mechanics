@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from sympy.printing.numpy import SciPyPrinter
 
 from mechanics.system import System
-from mechanics.symbol import Symbol
+from mechanics.symbol import Function
 from mechanics.util import python_name, name_type
 
 class PythonPrinter(SciPyPrinter):
@@ -18,7 +18,7 @@ class PythonPrinter(SciPyPrinter):
     #         return name
     
     def _print_AppliedUndef(self, expr):
-        if not isinstance(expr, Symbol):
+        if not isinstance(expr, Function):
             raise TypeError(f'Expected Symbol, got {type(expr)}, {expr}')
         if expr.args:
             return python_name(expr.name) + f'[{", ".join(map(str, expr.args))}]'
@@ -61,7 +61,7 @@ class Result:
 
 class Solver:
 
-    variables: tuple[Symbol, ...]
+    variables: tuple[Function, ...]
 
     def __init__(self, system: System):
 
@@ -70,20 +70,22 @@ class Solver:
         self.indices = system.indices
         self.constants = system.constants
         self.coordinates = system.coordinates
-        self.variables = system.coordinates + system.variables + system.definitions
+        self.variables = system.coordinates + system.variables + tuple(system.definitions.keys())
 
-        self.input = system.state_space()
+        self.input = cast(tuple[Function, ...], system.state_space())
 
         equations = []
         jacobian = []
 
-        unknowns_: set[Symbol] = set()
+        unknowns_: set[Function] = set()
 
-        for f in system.definitions:
+        for f, definition in system.definitions.items():
             unknowns_.update({f})
-            unknowns_.update({v for v in f.dependency if not system.is_constant(v)})
-        for eq in system.equations:
-            unknowns_.update({v for v in eq.dependency if not system.is_constant(v)})
+            unknowns_.update({v for v in self.system.dependencies_of(definition) 
+                              if not system.is_constant(v)})
+        for eq in system.equations.values():
+            unknowns_.update({v for v in self.system.dependencies_of(eq) 
+                              if not system.is_constant(v)})
         for v in self.input:
             if v in unknowns_:
                 unknowns_.remove(v)
@@ -96,8 +98,8 @@ class Solver:
         # for v in self.input:
         #     jacobian.append({v: 1})
         
-        for f in system.definitions:
-            equation = f - f.expr #type:ignore
+        for f, definition in system.definitions.items():
+            equation = f - definition #type:ignore
             equations.append(equation)
             derivatives = {}
             for v in unknowns:
@@ -105,7 +107,7 @@ class Solver:
                 if derivative != 0:
                     derivatives[v] = derivative
             jacobian.append(derivatives)
-        for eq in system.equations:
+        for eq in system.equations.values():
             equation = eq.lhs - eq.rhs #type:ignore
             equations.append(equation)
             derivatives = {}
