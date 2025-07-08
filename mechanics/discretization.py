@@ -36,14 +36,14 @@ class DiscretizedSystem(System):
                       min: name_type, max: name_type, step: expr_type) -> 'DiscretizedSystem':
         
         self.add_index(index, min, max)
-        index_ = cast(Index, self(index, return_as_tuple=False))
+        index_ = cast(Index, self(index, manipulate=False, return_as_tuple=False))
         if space is None: space_ = tuple(self._original._base_space.values())[0]
         else: space_ = cast(BaseSpace, self._original(space, return_as_tuple=False))
 
         self._discretized_spaces = { space_ : index_ }
         self._discretized_diffs[space_] = {}
 
-        self.define(space_.name, self(step, return_as_tuple=False) * index_) #type: ignore
+        self.define(space_.name, self(step, manipulate=False, return_as_tuple=False) * index_, manipulate=False) #type: ignore
 
         return self
     
@@ -80,7 +80,7 @@ class DiscretizedSystem(System):
                 # self.__replace_diff(q, (space_, 1))
                 # self.__replace_diff(q, (space_, 2))
 
-        for v in self._original.variables + self._original.constants:
+        for v in self._original._functions:
             new_index, new_base_space = self.__discretized_args(v)
             self.add_variable(v.name, index=new_index, base_space=new_base_space, space=v.space)
 
@@ -113,9 +113,9 @@ class DiscretizedSystem(System):
             return None
         
     def __discretized_args(self, v: Function) -> tuple[tuple[Index, ...], tuple[BaseSpace, ...]]:
-        new_index: list[Index] = list(v.index)
+        new_index: list[Index] = list(v.index.keys())
         new_base_space: list[BaseSpace] = []
-        for s in v.base_space:
+        for s in v.base_space.keys():
             if s in self._discretized_spaces: 
                 new_index.append(self._discretized_spaces[s])
             else:           
@@ -139,32 +139,52 @@ class DiscretizedSystem(System):
         if not diff_orders: 
             return sp.Derivative(expr, *args)
 
-
-        name = self._original.latex(sp.Derivative(expr, *list(diff_orders.items())))
+        dummy = Function.make(expr.name, (), tuple(expr.base_space.keys()), 
+                              expr.space, tuple(expr.base_space.values()))
+        name = self._original.latex(sp.Derivative(dummy, *list(diff_orders.items())))
 
         if name in self:
-            var = self[name]
+            var = cast(Function, self[name])
         else:
             self.add_variable(name, index=new_index, base_space=new_base_space, space=expr.space)
-            var = self[name]
+            var = cast(Function, self[name])
             for space_, diff_n in diff_orders.items():
                 self._discretized_diffs[space_][cast(Function, var)] = (expr, diff_n)
 
         if len(new_args) == 0:
-            return var
+            return var[*expr.index.values()]
         else:
-            return sp.Derivative(var, *new_args)
+            return sp.Derivative(var[*expr.index.values()], *new_args)
 
     
     def discretize_expr(self, expr: sp.Basic) -> sp.Expr:
         def replace_symbol(symbol: Function) -> Function:
-            return cast(Function, self[symbol.name])
+            if symbol.index:
+                return cast(Function, self[symbol.name][*symbol.index.values()]) #type:ignore
+            else:
+                return cast(Function, self[symbol.name])
         return (expr.replace(sp.Derivative, self.__replace_diff) #type:ignore
                     .replace(lambda x: isinstance(x, spf.AppliedUndef), replace_symbol)) #type:ignore
 
     def state_space(self, time: Optional[name_type] = None) -> tuple[sp.Expr, ...]:
         X = self._original.state_space(time or list(self._discretized_spaces.keys())[0])
         return tuple(cast(Function, self.discretize_expr(x)) for x in X)
+
+
+    def is_constant(self, expr: expr_type) -> bool:
+        exprs = self(expr, manipulate=False, return_as_tuple=True, simplify=False)
+        result = True
+        for expr in exprs: #type:ignore
+            if isinstance(expr, Function):
+                if expr.base_space or\
+                    (expr.index and [i for i in expr.index 
+                                     if i in self._discretized_spaces.values()]):
+                    result = False
+                    break
+            else:
+                result = False
+                break
+        return result
 
 class Discretizer:
 

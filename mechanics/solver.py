@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from sympy.printing.numpy import SciPyPrinter
 
 from mechanics.system import System
-from mechanics.symbol import Function
+from mechanics.symbol import Function, Expr, Index
 from mechanics.util import python_name, name_type
 
 class PythonPrinter(SciPyPrinter):
@@ -74,9 +74,6 @@ class Solver:
 
         self.input = cast(tuple[Function, ...], system.state_space())
 
-        equations = []
-        jacobian = []
-
         unknowns_: set[Function] = set()
 
         for f, definition in system.definitions.items():
@@ -90,17 +87,32 @@ class Solver:
             if v in unknowns_:
                 unknowns_.remove(v)
 
-        unknowns = list(unknowns_)
+        unknowns = set()
+        for u in unknowns_:
+            already_exixts = False
+            for v in unknowns.copy():
+                if v.is_general_form_of(u): 
+                    already_exixts = True
+                    break
+                if u.is_general_form_of(v): 
+                    unknowns.remove(v)
+                    break
+            if not already_exixts: 
+                unknowns.add(u)
+
+        unknowns = list(unknowns)
 
         print(f'Unknowns: {unknowns}')
         print(f'Variables: {self.variables}')
 
-        # for v in self.input:
-        #     jacobian.append({v: 1})
+        indices: list[tuple[Index, ...]] = []
+        equations: list[Expr] = []
+        jacobian = []
         
         for f, definition in system.definitions.items():
             equation = f - definition #type:ignore
             equations.append(equation)
+            indices.append(tuple(f.index.keys()))
             derivatives = {}
             for v in unknowns:
                 derivative = sp.diff(equation, v)
@@ -110,6 +122,7 @@ class Solver:
         for eq in system.equations.values():
             equation = eq.lhs - eq.rhs #type:ignore
             equations.append(equation)
+            indices.append(self.system.free_index_of(sp.Eq(eq.lhs, eq.rhs)))
             derivatives = {}
             for v in unknowns:
                 derivative = sp.diff(equation, v)
@@ -120,6 +133,8 @@ class Solver:
         self.unknowns = tuple(unknowns)
         self.equations = tuple(equations)
         self.jacobian = jacobian
+
+        print(indices)
 
         printer = PythonPrinter()
 

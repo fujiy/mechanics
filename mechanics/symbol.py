@@ -1,4 +1,5 @@
 from typing import Optional, cast, Any, Union
+import itertools
 import sympy as sp
 import sympy.core.function as spf
 import sympy.core.relational as spr
@@ -6,10 +7,11 @@ from mechanics.util import to_tuple
 from mechanics.space import Space
 
 Expr = sp.Expr
+Basic = sp.Basic
 
 class BaseSpace(sp.Symbol):
-    min: Optional[sp.Expr]
-    max: Optional[sp.Expr]
+    min: Optional[Expr]
+    max: Optional[Expr]
 
     def __new__(cls, name: str, diff_notation = None):
         return super().__new__(cls, name, real=True)
@@ -21,16 +23,24 @@ class BaseSpace(sp.Symbol):
         self.max = None
 
 class Index(sp.Symbol):
-    def __new__(cls, name: str, min: Optional[sp.Expr] = None, max: Optional[sp.Expr] = None):
+    min: Optional[Expr]
+    max: Optional[Expr]
+
+    def __new__(cls, name: str, min: Optional[Expr] = None, max: Optional[Expr] = None):
         return super().__new__(cls, name, integer=True)
     
-    def __init__(self, name: str, min: Optional[sp.Expr] = None, max: Optional[sp.Expr] = None):
+    def __init__(self, name: str, min: Optional[Expr] = None, max: Optional[Expr] = None):
         super().__init__()
         self.min = min
         self.max = max
 
-    def assign(self, value: sp.Expr) -> sp.Expr:
+    def assign(self, value: Expr) -> Expr:
         return value
+    
+    def list(self) -> list[Expr]:
+        if self.min is None or self.max is None:
+            raise ValueError(f'Index {self} has no min or max value')
+        return [self.assign(cast(Expr, i)) for i in range(int(self.min), int(self.max) + 1)]
 
 class Function(spf.AppliedUndef):
     name: str
@@ -52,7 +62,7 @@ class Function(spf.AppliedUndef):
                     spf.UndefinedFunction(name, bases=(Function,), **options)
                         (*args, index=index, base_space=base_space, space=space, **options)) #type:ignore
 
-    def __new__(cls, *args: sp.Basic, 
+    def __new__(cls, *args: Basic, 
                 index: tuple[Index, ...] = (),
                 base_space: Optional[tuple[BaseSpace, ...]],
                 space: Space, **options):
@@ -65,7 +75,16 @@ class Function(spf.AppliedUndef):
         var._space = space
 
         return var
+
     
+    @property
+    def func(self): #type:ignore
+        return lambda *args, **options: \
+                self.make(self.name, index=self._index, base_space=self._base_space,
+                          space=self._space, args=args, **options)
+    
+    # Indexing
+
     def __getitem__(self, index: Any) -> 'Function':
         args = cast(list[Expr], list(self.args))
         for n, i in enumerate(to_tuple(index)):
@@ -75,12 +94,50 @@ class Function(spf.AppliedUndef):
         return self.make(self.name, index=self._index, base_space=self._base_space, 
                          space=self._space, args=tuple(args))
     
-    @property
-    def func(self): #type:ignore
-        return lambda *args, **options: \
-                self.make(self.name, index=self._index, base_space=self._base_space,
-                          space=self._space, args=args, **options)
+    def at(self, index: Index, new_index: Any) -> 'Function':
+        if index not in self._index:
+            raise ValueError(f'Index {index} not in {self}')
+        index_ = self.index
+        index_[index] = index.assign(new_index)
+        return self[*index_.values()]
+
+    def enumerate(self) -> list['Function']:
+        if not self._index:
+            return [self]
+        
+        functions = []
+        for index in itertools.product(*[i.list() for i in self._index]):
+            functions.append(self[*index])
+        return functions
     
+
+    def general_form(self) -> 'Function':
+        return self.make(self.name, index=self._index, base_space=self._base_space,
+                         space=self._space)
+    
+    # Get Info
+
+    def is_bound(self, index: Optional[Index]) -> bool:
+        if index:
+            return index != self.index[index]
+        else:
+            return any(i != self.index[i] for i in self._index)
+        
+        
+    def is_general_form_of(self, other: 'Function') -> bool:
+        if self.name != other.name: return False
+        for (i, i_value), (j, j_value) in zip(self.index.items(), other.index.items()):
+            if i != j: return False
+            if i_value == j_value: continue
+            if i == i_value: continue
+            return False
+        for (s, s_value), (t, t_value) in zip(self.base_space.items(), other.base_space.items()):
+            if s != t: return False
+            if s_value == t_value: continue
+            if s == s_value: continue
+            return False 
+        return True
+   
     # Printing
 
     def _sympystr(self, printer) -> str:
@@ -101,23 +158,28 @@ class Function(spf.AppliedUndef):
     # Properties
       
     @property
-    def base_space(self) -> tuple[BaseSpace, ...]:
-        return self._base_space
+    def base_space(self) -> dict[BaseSpace, Expr]:
+        return dict(zip(self._base_space, 
+                        cast(tuple[Expr, ...], 
+                             self.args[len(self._index):len(self._index) + len(self._base_space)])))
     
     @property
     def space(self) -> Space:
         return self._space
     
     @property
-    def index(self) -> tuple[Index, ...]:
-        return self._index
+    def index(self) -> dict[Index, Expr]:
+        return dict(zip(self._index, 
+                        cast(tuple[Expr, ...], self.args[:len(self._index)])))
     
     @property
     def free_index(self) -> tuple[Index, ...]:
         return tuple(i for n, i in enumerate(self._index) if i != self.args[n])
+
+
     
     @property
-    def args_subs(self) -> dict[Union[Index, BaseSpace], sp.Basic]:
+    def args_subs(self) -> dict[Union[Index, BaseSpace], Basic]:
         index_args = self.args[:len(self._index)]
         space_args = self.args[len(self._index):]
         return { i: a for i, a in zip(self._index, index_args) if i != a } | \
@@ -137,7 +199,7 @@ class Function(spf.AppliedUndef):
 #                     spf.UndefinedFunction(name, bases=(Variable,), **options)
 #                         (*args, index=index, base_space=base_space, space=space, **options)) #type:ignore
 
-#     def __new__(cls, *args: sp.Basic, 
+#     def __new__(cls, *args: Basic, 
 #                 index: tuple[Index, ...] = (),
 #                 base_space: Optional[tuple[BaseSpace, ...]],
 #                 space: Space, **options):
@@ -175,15 +237,15 @@ class Function(spf.AppliedUndef):
     
     
 # class Definition(Symbol):
-#     _expr: sp.Expr
+#     _expr: Expr
 #     _is_definition: bool
 
 #     @classmethod
 #     def make(cls, name: str, 
 #              index: tuple[Index, ...],
 #              base_space: tuple[BaseSpace, ...], 
-#              expr: sp.Expr, condition: sp.Basic = sp.true,
-#              args: Optional[tuple[sp.Basic, ...]] = None,
+#              expr: Expr, condition: Basic = sp.true,
+#              args: Optional[tuple[Basic, ...]] = None,
 #              **options) -> 'Definition':
 #         if args is None: 
 #             args = index + base_space
@@ -195,10 +257,10 @@ class Function(spf.AppliedUndef):
 #                         (*args, index=index, base_space=base_space,  #type: ignore
 #                         expr=expr, condition=condition, **options)) #type:ignore
     
-#     def __new__(cls, *args: sp.Basic, 
+#     def __new__(cls, *args: Basic, 
 #                 index: tuple[Index, ...] = (),
 #                 base_space: Optional[tuple[BaseSpace, ...]] = None, 
-#                 expr: sp.Expr, condition: sp.Basic = sp.true, **options):
+#                 expr: Expr, condition: Basic = sp.true, **options):
 #         f = cast(Definition, super().__new__(cls, *args, **options))
 
 #         # print('new', id(f), args, index, base_space, expr, condition)
@@ -213,7 +275,7 @@ class Function(spf.AppliedUndef):
 #         if base_space is None or args[len(base_space):] == base_space:
 #             expr = expr
 #         else:
-#             expr = cast(sp.Expr, expr.subs({ old: new for old, new in zip(base_space, args[len(index):]) if old != new }))
+#             expr = cast(Expr, expr.subs({ old: new for old, new in zip(base_space, args[len(index):]) if old != new }))
             
 #         if condition is sp.true:
 #             f._expr = expr
@@ -240,21 +302,21 @@ class Function(spf.AppliedUndef):
 #                 raise IndexError(f'{str(self)} has only {len(self._index)} indices')
 #             args[n] = self._index[n].assign(i)
 #         return self.make(self.name, index=self._index, base_space=self._base_space,
-#                          expr=cast(sp.Expr, self.single_expr), condition=sp.true, args=tuple(args))
+#                          expr=cast(Expr, self.single_expr), condition=sp.true, args=tuple(args))
 #         # return self.__class__(*args, index=self._index, base_space=self._base_space, 
-#         #                       expr=cast(sp.Expr, self.single_expr), condition=sp.true)
+#         #                       expr=cast(Expr, self.single_expr), condition=sp.true)
 
 #     @property
-#     def single_expr(self) -> sp.Expr:
+#     def single_expr(self) -> Expr:
 #         subs = []
 #         for n, i in enumerate(self.args[:len(self._index)]):
 #             subs.append((self._index[n], i))
 #         return self._expr.subs(subs) # type:ignore
     
 #     @property
-#     def cases(self) -> tuple[tuple[sp.Expr, sp.Basic], ...]:
+#     def cases(self) -> tuple[tuple[Expr, Basic], ...]:
 #         if isinstance(self._expr, sp.Piecewise):
-#             return cast(tuple[tuple[sp.Expr, sp.Basic], ...], self._expr.args)
+#             return cast(tuple[tuple[Expr, Basic], ...], self._expr.args)
 #         else:
 #             return ((self._expr, sp.true),)
         

@@ -77,7 +77,7 @@ class Integrator(Discretizer):
                 lhs_applied = self.system.discretize_expr(eq.lhs).subs(subs)
                 rhs_applied = self.system.discretize_expr(eq.rhs).subs(subs)
         
-                self.system.equate(lhs_applied, rhs_applied, label=eq.label + f'_{{{label}}}')
+                self.system.equate(lhs_applied, rhs_applied, label=f'{{{eq.label}}}_{{{label}}}')
 
 
         self.step_equations(replace_equation)
@@ -106,13 +106,13 @@ class Euler(Integrator):
         K: list[sp.Expr] = []
         for dx in self.dX:
             k_name = f'{{k_{{{dx.name}}}}}'
-            self.system.add_variable(k_name, index=dx.index)
+            self.system.add_variable(k_name, index=tuple(dx.index.keys()))
             K.append(self.system[k_name])
 
         replace_equation(self.X, tuple(K), 'K')
 
         for x, k in zip(self.X, K):
-            self.system.equate(x[self.index + 1], x + step * k, label=f'{{{self.name}}}_{{{x.name}}}')
+            self.system.equate(x.at(self.index, self.index + 1), x + step * k, label=f'{{{self.name}}}_{{{x.name}}}')
     
 class RK2(Integrator):
 
@@ -130,8 +130,8 @@ class RK2(Integrator):
         for dx in self.dX:
             k1_name = f'{{k_{{1{dx.name}}}}}'
             k2_name = f'{{k_{{2{dx.name}}}}}'
-            self.system.add_variable(k1_name, index=dx.index)
-            self.system.add_variable(k2_name, index=dx.index)
+            self.system.add_variable(k1_name, index=tuple(dx.index.keys()))
+            self.system.add_variable(k2_name, index=tuple(dx.index.keys()))
             K1.append(self.system[k1_name])
             K2.append(self.system[k2_name])
 
@@ -165,10 +165,10 @@ class RK4(Integrator):
             k2_name = f'{{k_{{2{dx.name}}}}}'
             k3_name = f'{{k_{{3{dx.name}}}}}'
             k4_name = f'{{k_{{4{dx.name}}}}}'
-            self.system.add_variable(k1_name, index=dx.index)
-            self.system.add_variable(k2_name, index=dx.index)
-            self.system.add_variable(k3_name, index=dx.index)
-            self.system.add_variable(k4_name, index=dx.index)
+            self.system.add_variable(k1_name, index=tuple(dx.index.keys()))
+            self.system.add_variable(k2_name, index=tuple(dx.index.keys()))
+            self.system.add_variable(k3_name, index=tuple(dx.index.keys()))
+            self.system.add_variable(k4_name, index=tuple(dx.index.keys()))
             K1.append(self.system[k1_name])
             K2.append(self.system[k2_name])
             K3.append(self.system[k3_name])
