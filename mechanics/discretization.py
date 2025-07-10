@@ -85,7 +85,7 @@ class DiscretizedSystem(System):
             self.add_variable(v.name, index=new_index, base_space=new_base_space, space=v.space)
 
         for name, definition in self._original._definitions.items():
-            self.define(name, cast(sp.Expr, self.discretize_expr(definition)))
+            self.define(name, cast(sp.Expr, self.discretize_expr(definition)), manipulate=False)
 
         for discretizer, options in self._discretizers:
             discretizer.setup(self._original, self, **options)
@@ -96,7 +96,8 @@ class DiscretizedSystem(System):
             for eq in self._original._equations.values():
                 self.equate(self.discretize_expr(cast(sp.Expr, eq.lhs)), 
                             self.discretize_expr(cast(sp.Expr, eq.rhs)), 
-                            label=eq.label)
+                            label=eq.label,
+                            manipulate=False)
             
             # if applied: break
             # if not applied:

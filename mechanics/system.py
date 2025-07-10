@@ -187,7 +187,7 @@ class System:
         if isinstance(expr, Equation):
             rhs = expr.rhs
             expr = expr.lhs
-
+            
         expr = cast(tuple[Expr, ...], self(expr, return_as_tuple=True, **options))
         rhs  = cast(tuple[Expr, ...], self(rhs,  return_as_tuple=True, **options))
         if len(rhs) == 1: rhs = rhs * len(expr)

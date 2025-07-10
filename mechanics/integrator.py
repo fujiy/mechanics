@@ -65,7 +65,7 @@ class Integrator(Discretizer):
                             name = dx_new.name #type:ignore
                         else:
                             name = str(dx_new)
-                        self.system.equate(x_new, dx_new, label=f'State_{{{name}}}')
+                        self.system.equate(x_new, dx_new, label=f'State_{{{name}}}', manipulate=False)
 
             subs = {}
             for x, x_new, dx, dx_new in zip(self.X, X, self.dX, dX):
@@ -77,7 +77,7 @@ class Integrator(Discretizer):
                 lhs_applied = self.system.discretize_expr(eq.lhs).subs(subs)
                 rhs_applied = self.system.discretize_expr(eq.rhs).subs(subs)
         
-                self.system.equate(lhs_applied, rhs_applied, label=f'{{{eq.label}}}_{{{label}}}')
+                self.system.equate(lhs_applied, rhs_applied, label=f'{{{eq.label}}}_{{{label}}}', manipulate=False)
 
 
         self.step_equations(replace_equation)
@@ -112,7 +112,9 @@ class Euler(Integrator):
         replace_equation(self.X, tuple(K), 'K')
 
         for x, k in zip(self.X, K):
-            self.system.equate(x.at(self.index, self.index + 1), x + step * k, label=f'{{{self.name}}}_{{{x.name}}}')
+            self.system.equate(x.at(self.index, self.index + 1), x + step * k, 
+                               label=f'{{{self.name}}}_{{{x.name}}}', 
+                               manipulate=False)
     
 class RK2(Integrator):
 
@@ -123,7 +125,7 @@ class RK2(Integrator):
         self.name = 'RK2'
 
     def step_equations(self, replace_equation: Callable[[tuple[sp.Expr, ...], tuple[sp.Expr, ...], str], None]):
-        step = cast(sp.Expr, self.system(self.step))
+        step = cast(sp.Expr, self.system(self.step, manipulate=False))
 
         K1: list[sp.Expr] = []
         K2: list[sp.Expr] = []
@@ -140,7 +142,8 @@ class RK2(Integrator):
 
         for x, k1, k2 in zip(self.X, K1, K2):
             self.system.equate(x[self.index + 1], x + step / 2 * (k1 + k2), 
-                               label=f'{{{self.name}}}_{{{x.name}}}')
+                               label=f'{{{self.name}}}_{{{x.name}}}',
+                               manipulate=False)
 
 ImprovedEuler = RK2
 Heun = RK2
@@ -154,7 +157,7 @@ class RK4(Integrator):
         self.name = 'RK4'
 
     def step_equations(self, replace_equation: Callable[[tuple[sp.Expr, ...], tuple[sp.Expr, ...], str], None]):
-        step = cast(sp.Expr, self.system(self.step))
+        step = cast(sp.Expr, self.system(self.step, manipulate=False))
 
         K1: list[sp.Expr] = []
         K2: list[sp.Expr] = []
@@ -181,4 +184,5 @@ class RK4(Integrator):
 
         for x, k1, k2, k3, k4 in zip(self.X, K1, K2, K3, K4):
             self.system.equate(x[self.index + 1], x + step / 6 * (k1 + 2*k2 + 2*k3 + k4), 
-                               label=f'{{{self.name}}}_{{{x.name}}}')
+                               label=f'{{{self.name}}}_{{{x.name}}}',
+                               manipulate=False)
