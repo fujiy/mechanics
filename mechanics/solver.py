@@ -219,8 +219,9 @@ class Solver:
         value_jacobian = np.zeros((len(self.unknowns), len(self.unknowns)), dtype=float)
         value_equation = np.zeros((len(self.unknowns)), dtype=float)
 
-
         result = Result(self.system)
+
+        psudo_inverse_warning = False
 
         for i_ in tqdm(value_indices[0]):
 
@@ -250,7 +251,14 @@ class Solver:
                     # plt.colorbar()  # 色の凡例
                     # plt.show()
 
-                    value_residual = linalg.solve(value_jacobian, value_equation)
+                    try:
+                        value_residual = linalg.solve(value_jacobian, value_equation)
+                    except linalg.LinAlgError as e:
+                        if not psudo_inverse_warning:
+                            psudo_inverse_warning = True
+                            print(f'warning: Singular matrix encountered in Newton method, using pseudo-inverse. rank: {np.linalg.matrix_rank(value_jacobian)} / {value_jacobian.shape[0]}')
+                        value_residual = linalg.pinv(value_jacobian) @ value_equation
+                        
                     value_unknowns -= value_residual
 
                     self.setter_generated(*value_constants,i_,*value_variables, value_unknowns)
