@@ -173,7 +173,8 @@ class Solver:
         self.setter_generated = setter_generated #type:ignore
 
     def run(self, condition: dict[name_type, float], 
-            newton_max_iter: int = 100, newton_tol: float = 1e-8) -> Result:
+            newton_max_iter: int = 100, newton_tol: float = 1e-8,
+            initial_epsilon: float = 1e-6) -> Result:
         condition_ = { self.system(name): value for name, value in condition.items()}
 
         index = self.indices[0]
@@ -202,13 +203,16 @@ class Solver:
         for v in self.variables:
             if v in self.input:
                 if v in condition_:
-                    values = np.zeros((N+1,), dtype=float)
+                    values = np.empty((N+1,), dtype=float)
+                    values[:] = np.nan
                     values[0] = condition_[v]
                     value_variables.append(values)
                 else:
                     raise ValueError(f'Value of {v} must be provided in condition')
             else:
-                values = np.zeros((N+1,), dtype=float)
+                values = np.empty((N+1,), dtype=float)
+                values[:] = np.nan
+                values[0] = initial_epsilon * np.random.randn()  # Random initial guess
                 value_variables.append(values)
 
         value_unknowns = np.zeros((len(self.unknowns)), dtype=float)
@@ -220,21 +224,44 @@ class Solver:
 
         for i_ in tqdm(value_indices[0]):
 
+            for values in value_variables:
+                if np.isnan(values[i_ + 1]):
+                    values[i_ + 1] = values[i_] # + initial_epsilon * np.random.randn()
+
             for newton_iter in range(0, newton_max_iter + 1):
+                try:
+                    self.equations_generated(*value_constants,i_,*value_variables, value_equation)
+                    self.jacobian_generated(*value_constants,i_,*value_variables, value_jacobian)
 
-                self.equations_generated(*value_constants,i_,*value_variables, value_equation)
-                self.jacobian_generated(*value_constants,i_,*value_variables, value_jacobian)
+                    # print('vars 0', np.array(value_variables)[:,newton_iter])
+                    # print('vars 1', np.array(value_variables)[:,newton_iter + 1])
+                    # print('equations', value_equation)
 
-                value_residual = linalg.solve(value_jacobian, value_equation)
-                value_unknowns -= value_residual
 
-                self.setter_generated(*value_constants,i_,*value_variables, value_unknowns)
+                    # with np.printoptions(threshold=np.inf):
+                    #     print('jacobian',value_jacobian)
 
-                if np.linalg.norm(value_residual) < newton_tol:
-                    result.newton_converged_iters.append(newton_iter)
-                    break
-                if newton_iter == newton_max_iter:
-                    raise ValueError('Newton did not converge in {newton_max_iter} iterations')
+                    # print('jacobian', np.linalg.matrix_rank(value_jacobian), value_jacobian.shape)
+
+                    # import matplotlib.pyplot as plt
+
+                    # # 可視化
+                    # plt.imshow(value_jacobian, cmap='viridis', interpolation='nearest')
+                    # plt.colorbar()  # 色の凡例
+                    # plt.show()
+
+                    value_residual = linalg.solve(value_jacobian, value_equation)
+                    value_unknowns -= value_residual
+
+                    self.setter_generated(*value_constants,i_,*value_variables, value_unknowns)
+
+                    if np.linalg.norm(value_residual) < newton_tol:
+                        result.newton_converged_iters.append(newton_iter)
+                        break
+                    if newton_iter == newton_max_iter:
+                        raise ValueError('Newton did not converge in {newton_max_iter} iterations')
+                except:
+                    raise Exception(f'Exception at index {i_}, iter {newton_iter}')
 
         result.set_data(self.constants, value_constants)
         result.set_data(self.variables, value_variables, N=N)
@@ -244,7 +271,7 @@ class Solver:
         
 
 
-    def plot_jacobian(self):
+    def plot_jacobian(self, ticks = True):
         jacobian_matrix = np.zeros((len(self.equations), len(self.unknowns)), dtype=int)
         for i, row in enumerate(self.jacobian):
             for j, var in enumerate(self.unknowns):
@@ -257,10 +284,14 @@ class Solver:
         plt.figure(figsize=(5, 5))
         plt.imshow(jacobian_matrix, cmap='Greys', interpolation='none')
         plt.title("Jacobian")
-        plt.xticks(ticks=range(len(self.unknowns)), 
-                   labels=[f'${self.system.latex(v)}$' for v in self.unknowns], rotation=90)
+        if ticks:
+            plt.xticks(ticks=range(len(self.unknowns)), 
+                       labels=[f'${self.system.latex(v)}$' for v in self.unknowns], rotation=90)
         plt.gca().xaxis.set_ticks_position('top')
         plt.gca().xaxis.set_label_position('top')
         plt.show()
+
+        # print('shape:', jacobian_matrix.shape)
+        # print('rank:', np.linalg.matrix_rank(jacobian_matrix))
 
     
