@@ -1,7 +1,9 @@
 from typing import cast, Any
+import warnings
 import numpy as np
 import numpy
 from scipy import linalg
+from scipy import sparse
 from tqdm import tqdm
 import sympy as sp
 import matplotlib.pyplot as plt
@@ -134,11 +136,13 @@ class Solver:
         self.equations = tuple(equations)
         self.jacobian = jacobian
 
-        print(indices)
+        # print(indices)
+        print(f'Equations: {len(equations)}, unknowns: {len(unknowns)}')
 
         printer = PythonPrinter()
 
         args_str = ', '.join([python_name(v.name) for v in self.constants + self.indices + self.variables])
+        constants_str = ', '.join([python_name(v.name) for v in self.constants])
 
         equations_str = f'def equations_generated({args_str}, _):\n'
         for i, eq in enumerate(equations):
@@ -147,11 +151,33 @@ class Solver:
 
         unknowns_indices = {v: i for i, v in enumerate(self.unknowns)}
 
+        jacobian_rows = []
+        jacobian_cols = []
+
+        variables_set = set(self.variables)
+
         jacobian_str = f'def jacobian_generated({args_str}, _):\n'
+        jacobian_initial_str = f'def jacobian_initial_generated({constants_str}, _):\n'
+        n = 0
         for i, derivatives in enumerate(self.jacobian):
             for v, derivative in derivatives.items():
-                if derivative != 0:
-                    jacobian_str += f'  _[{i}, {unknowns_indices[v]}] = {printer.doprint(derivative)}\n'
+                j = unknowns_indices[v]
+                # print(i, j, v, derivative, self.system.dependencies_of(derivative) & unknowns_set)
+                # print(derivative.is_constant())
+                if derivative == 0:
+                    continue
+
+                jacobian_rows.append(i)
+                jacobian_cols.append(j)
+
+                if self.system.dependencies_of(derivative) & variables_set:
+                    # jacobian_str += f'  _[{i}, {j}] = {printer.doprint(derivative)}\n'
+                    jacobian_str += f'  _[{n}] = {printer.doprint(derivative)}\n'
+                else:
+                    jacobian_initial_str += f'  _[{n}] = {printer.doprint(derivative)}\n'
+                
+                n += 1
+
         # jacobian_str += f'  return _\n'
         # equation_str = '[\n  ' + ',\n  '.join([cast(str, printer.doprint(eq)) for eq in equations]) + '\n]'
 
@@ -161,16 +187,21 @@ class Solver:
 
         # print(equations_str)
         # print(jacobian_str)
+        # print(jacobian_initial_str)
         # print(setter_str)
-
 
         exec(equations_str, globals())
         exec(jacobian_str, globals())
+        exec(jacobian_initial_str, globals())
         exec(setter_str, globals())
 
         self.equations_generated = equations_generated #type:ignore
         self.jacobian_generated = jacobian_generated #type:ignore
+        self.jacobian_initial_generated = jacobian_initial_generated #type:ignore
         self.setter_generated = setter_generated #type:ignore
+
+        self.jacobian_rows = jacobian_rows
+        self.jacobian_cols = jacobian_cols
 
     def run(self, condition: dict[name_type, float], 
             newton_max_iter: int = 100, newton_tol: float = 1e-8,
@@ -216,8 +247,15 @@ class Solver:
                 value_variables.append(values)
 
         value_unknowns = np.zeros((len(self.unknowns)), dtype=float)
-        value_jacobian = np.zeros((len(self.unknowns), len(self.unknowns)), dtype=float)
         value_equation = np.zeros((len(self.unknowns)), dtype=float)
+        
+        value_jacobian_data = np.zeros(len(self.jacobian_rows))
+        self.jacobian_initial_generated(*value_constants, value_jacobian_data)
+
+        value_jacobian = sparse.coo_matrix((value_jacobian_data, (self.jacobian_rows, self.jacobian_cols)), 
+                                           shape=(len(self.unknowns), len(self.unknowns))).tocsr()
+        
+        # np.zeros((len(self.unknowns), len(self.unknowns)), dtype=float)
 
         result = Result(self.system)
 
@@ -232,7 +270,9 @@ class Solver:
             for newton_iter in range(0, newton_max_iter + 1):
                 try:
                     self.equations_generated(*value_constants,i_,*value_variables, value_equation)
-                    self.jacobian_generated(*value_constants,i_,*value_variables, value_jacobian)
+                    # self.jacobian_generated(*value_constants,i_,*value_variables, value_jacobian)
+                    self.jacobian_generated(*value_constants,i_,*value_variables, value_jacobian_data)
+                    value_jacobian.data = value_jacobian_data
 
                     # print('vars 0', np.array(value_variables)[:,newton_iter])
                     # print('vars 1', np.array(value_variables)[:,newton_iter + 1])
@@ -244,20 +284,28 @@ class Solver:
 
                     # print('jacobian', np.linalg.matrix_rank(value_jacobian), value_jacobian.shape)
 
-                    # import matplotlib.pyplot as plt
+                    with warnings.catch_warnings(record=True) as w:
+                        # value_residual = linalg.solve(value_jacobian, value_equation)
+                        warnings.simplefilter("always", category=sparse.linalg.MatrixRankWarning)
+                        value_residual = sparse.linalg.spsolve(value_jacobian, value_equation)
 
-                    # # 可視化
-                    # plt.imshow(value_jacobian, cmap='viridis', interpolation='nearest')
-                    # plt.colorbar()  # 色の凡例
-                    # plt.show()
+                        if any(issubclass(warning.category, sparse.linalg.MatrixRankWarning) for warning in w):
 
-                    try:
-                        value_residual = linalg.solve(value_jacobian, value_equation)
-                    except linalg.LinAlgError as e:
-                        if not psudo_inverse_warning:
-                            psudo_inverse_warning = True
-                            print(f'warning: Singular matrix encountered in Newton method, using pseudo-inverse. rank: {np.linalg.matrix_rank(value_jacobian)} / {value_jacobian.shape[0]}')
-                        value_residual = linalg.pinv(value_jacobian) @ value_equation
+                            value_jacobian_array = value_jacobian.toarray()
+                            if not psudo_inverse_warning:
+                                psudo_inverse_warning = True
+                                # value_jacobian_array = value_jacobian.toarray()
+                                print(f'warning: Singular matrix encountered in Newton method, using pseudo-inverse. rank: {np.linalg.matrix_rank(value_jacobian_array)} / {value_jacobian_array.shape[0]}')
+                                
+                                # u, s, vh = np.linalg.svd(value_jacobian_array)
+                                # print('Singular values:', s)
+
+                                import matplotlib.pyplot as plt
+                                plt.imshow(value_jacobian.toarray(), cmap='viridis', interpolation='nearest')
+                                plt.colorbar()
+                                plt.show()
+                            value_residual = linalg.pinv(value_jacobian_array) @ value_equation
+                            # value_residual = sparse.linalg.lgmres(value_jacobian, value_equation)[0]
                         
                     value_unknowns -= value_residual
 
@@ -276,18 +324,17 @@ class Solver:
 
         return result
                 
-        
-
 
     def plot_jacobian(self, ticks = True):
+        variables = set(self.variables)
         jacobian_matrix = np.zeros((len(self.equations), len(self.unknowns)), dtype=int)
         for i, row in enumerate(self.jacobian):
             for j, var in enumerate(self.unknowns):
                 if var in row:
-                    if row[var] == 1:
-                        jacobian_matrix[i, j] = 1
-                    else:
+                    if self.system.dependencies_of(row[var]) & variables:
                         jacobian_matrix[i, j] = 2
+                    else:
+                        jacobian_matrix[i, j] = 1
 
         plt.figure(figsize=(5, 5))
         plt.imshow(jacobian_matrix, cmap='Greys', interpolation='none')
