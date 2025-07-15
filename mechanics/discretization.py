@@ -80,7 +80,11 @@ class DiscretizedSystem(System):
                 # self.__replace_diff(q, (space_, 1))
                 # self.__replace_diff(q, (space_, 2))
 
-        for v in self._original._functions:
+        for c in self._original.constants:
+            new_index, new_base_space = self.__discretized_args(c)
+            self.add_constant(c.name, index=new_index, space=c.space)
+
+        for v in self._original.variables:
             new_index, new_base_space = self.__discretized_args(v)
             self.add_variable(v.name, index=new_index, base_space=new_base_space, space=v.space)
 

@@ -12,4 +12,7 @@ setup(
         'sympy',
         'matplotlib',
     ],
+    package_data={
+        'mechanics': ['mechanics/fortran/*.f90'],
+    },
 )

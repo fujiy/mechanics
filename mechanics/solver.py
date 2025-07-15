@@ -1,12 +1,21 @@
 from typing import cast, Any, Optional
 from collections import defaultdict
+import tempfile
+import os
+import importlib
+import importlib.resources
+import importlib.util
+import shutil
+import sys
+import subprocess
+import textwrap
 import warnings
 import numpy as np
-import numpy
 from scipy import linalg
 from scipy import sparse
 from tqdm import tqdm
 import sympy as sp
+import sympy.printing.fortran
 import matplotlib.pyplot as plt
 from sympy.printing.numpy import SciPyPrinter
 import networkx as nx
@@ -28,6 +37,19 @@ class PythonPrinter(SciPyPrinter):
             return python_name(expr.name) + f'[{", ".join(map(str, expr.args))}]'
         else:
             return python_name(expr.name)
+        
+class FortranPrinter(sympy.printing.fortran.FCodePrinter):
+    # def __init__(self, **settings) -> None:
+    #     super().__init__(**settings | {'source_format': 'free'})
+
+    def _print_Symbol(self, expr):
+        name = super()._print_Symbol(expr)
+        return '!!!!'
+        return python_name(name)
+    
+    def _print_Function(self, expr):
+        return str(expr)
+    
         
 class Result:
     def __init__(self, system: System):
@@ -75,21 +97,62 @@ class Dependency:
         return f'{self.eq.label} <- {self.var.name}, {self.index_mapping}'
     
 class Block:
-    def __init__(self, id: int, equations: list[Equation], unknowns: list[Function], knowns: list[Function]):
+    def __init__(self, id: int, 
+                 equations: list[Equation],
+                 unknowns: list[Function], 
+                 knowns: list[Function]):
         self.id = id
         self.equations = tuple(equations)
         self.unknowns = tuple(unknowns)
         self.knowns = tuple(knowns)
 
-        self.jacobian = {}
+        self.dim = len(self.equations)
+
+        self.jacobian: defaultdict[Equation, dict[Function, Expr]] = defaultdict(dict)
         for eq in self.equations:
             derivatives = {}
             for v in unknowns:
-                derivative = sp.diff(eq, v)
+                derivative = sp.diff(eq.lhs - eq.rhs, v)
                 if derivative != 0:
                     derivatives[v] = derivative
             if derivatives:
-                self.jacobian[name] = derivatives
+                self.jacobian[eq] = derivatives
+
+        print(self.jacobian)
+
+    def generate_fortran(self, printer: FortranPrinter) -> str:
+        args = ', '.join([ v.name for v in self.unknowns + self.knowns ])
+        code = f'''
+        subroutine block_{self.id}_equation({args}, eq)
+            use constants
+            implicit none
+            real(8), dimension(0:{self.dim}-1), intent(out) :: eq'''
+        for v in self.unknowns + self.knowns:
+            code += f'''
+            real(8), intent(in) :: {v.name}'''
+        for i, eq in enumerate(self.equations):
+            code += f'''
+            eq({i}) = {printer.doprint(eq.lhs - eq.rhs)} ! {eq.label}'''
+        code += f'''
+        end subroutine block_{self.id}_equation
+
+        subroutine block_{self.id}_jacobian({args}, jac)
+            use constants
+            implicit none
+            real(8), dimension(0:{self.dim}-1, 0:{self.dim}-1), intent(out) :: jac'''
+        for v in self.unknowns + self.knowns:
+            code += f'''
+            real(8), intent(in) :: {v.name}'''
+        for i, eq in enumerate(self.equations):
+            for j, v in enumerate(self.unknowns):
+                if v in self.jacobian[eq]:
+                    code += f'''
+            jac({i}, {j}) = {printer.doprint(self.jacobian[eq][v])} ! d({eq.label})/d({v.name})'''
+
+        code += f'''
+        end subroutine block_{self.id}_jacobian
+        '''
+        return textwrap.dedent(code)
 
     def __repr__(self) -> str:
         return f'Block #{self.id}(equations={tuple(eq.label for eq in self.equations)}, unknowns={self.unknowns}), knowns={self.knowns})'
@@ -277,6 +340,8 @@ class Solver:
 
         print(f'Indices: {self.indices}')
 
+        self.tempdir = tempfile.mkdtemp()
+
         if input is None:
             self.input = tuple(cast(Function, v) for v in system.state_space())
         else:
@@ -298,11 +363,113 @@ class Solver:
         print('match', max_matching)
 
         blocks = self.block_decomposition()
-
         for block in blocks:
             print(block)
 
+        printer = FortranPrinter({'source_format': 'free', 'strict': False, 'standard': 95, 'precision': 15})
+        
+        dim_max = max([block.dim for block in blocks])
+    
+        code = ''
+        code += f'''
+        module constants
+            real(8), parameter :: pi = 3.14159265358979323846
+        end module constants
+
+        module variables'''
+        for v in self.indices + self.variables:
+            code += f'''
+            real(8), save :: {v.name} = 0.0'''
+        code += f'''
+        end module variables
+
+        module blocks
+        contains
+        '''
+
+        for block in blocks:
+            code += textwrap.indent(block.generate_fortran(printer), ' '*12)
+
+        code += f'''
+        end module blocks
+                                
+        subroutine run_solver(status, message)
+            use, intrinsic :: ieee_arithmetic
+            use constants
+            use variables
+            use blocks
+            implicit none
+            double precision dnrm2
+            external dnrm2
+
+            integer, intent(out) :: status
+            character(len=100), intent(out) :: message
+            
+            real(8), dimension(0:{dim_max}-1) :: eq
+            real(8), dimension(0:{dim_max}-1,0:{dim_max}-1) :: jac
+            real(8), dimension(0:{dim_max}-1) :: vars
+            integer, dimension({dim_max}-1) :: ipiv
+            integer :: info
+            real(8) :: residual
+            integer :: newton_iter
+            real(8) :: tol = 1e-8
+            integer :: i
+                                
+            print *, "Started"
+                                '''
+        for block in blocks:
+            args = ', '.join([v.name for v in block.unknowns + block.knowns])
+            code += f'''
+            ! --- Block {block.id} ---
+
+            call block_{block.id}_equation({args}, eq)
+
+            do newton_iter = 1, 100
+                jac = 0
+
+                call block_{block.id}_jacobian({args}, jac)
+
+                ! jac * r = eq; eq = r
+                call dgesv({block.dim}, 1, jac, {block.dim}, ipiv, eq, {block.dim}, info)
+                '''
+            for i, v in enumerate(block.unknowns):
+                code += f'''
+                {v.name} = {v.name} - eq({i})'''
+            code += f'''
+                call block_{block.id}_equation({args}, eq)
+
+                residual = dnrm2({block.dim}, eq, 1)
+
+                if (ieee_is_nan(residual)) then
+                    write(message, '("Block {block.id}, nan: ", i5, E10.4)') newton_iter, residual
+                    status = 1
+                    return
+                end if
+                if (residual < tol) exit
+            end do
+            if (residual >= tol) then
+                write(message, '("Block {block.id} not converging: ", i5, ", ", E10.4)') newton_iter, residual
+                status = 1
+                return
+            else
+                print "('  Block {block.id} converged in ', i3, ' iterations, residual = ', E10.4)", newton_iter, residual
+            end if
+            '''
+            
+        code += f'''
+            print *, "Completed"
+        end subroutine run_solver
+        '''
+        code = textwrap.dedent(code)
+        print(code)
+
+        print(self.tempdir)
+
+        self.module = self.compile_and_load(code, [])
+
         return
+
+
 
         # Collect unknowns from definitions and equations
 
@@ -431,10 +598,19 @@ class Solver:
         self.jacobian_initial_generated = jacobian_initial #type:ignore
         self.setter_generated = setter_generated #type:ignore
 
+    # def __del__(self):
+    #     shutil.rmtree(self.tempdir)
+
     def run(self, condition: dict[name_type, float], 
             newton_max_iter: int = 100, newton_tol: float = 1e-8,
             initial_epsilon: float = 1e-6) -> Result:
         condition_ = { self.system(name): value for name, value in condition.items()}
+
+        status, message = self.module.run_solver()
+        if status != 0:
+            raise RuntimeError(message.decode('utf-8'))
+
+        return
 
         index = self.indices[0]
         index_start = index.min or 0
@@ -557,6 +733,44 @@ class Solver:
         result.set_data(self.definitions.keys(), value_definitions, N=N)
 
         return result
+    
+    def compile_and_load(self, source: str, libs: list[str] = []) -> Any:
+
+        with open(os.path.join(self.tempdir, 'generated.f90'), 'w') as f:
+            f.write(source)
+
+        lib_files = [str(importlib.resources.files('mechanics').joinpath(f'fortran/{filename}'))
+            for filename in libs]
+
+        shell_path = subprocess.check_output(['bash', '-l', '-c', 'echo $PATH']).decode().strip()
+        env = os.environ.copy()
+        env["PATH"] += ':' + shell_path
+        generated_name = 'generated'
+        ret = subprocess.run([
+            sys.executable, '-m', 'numpy.f2py', '-m', generated_name, 
+            '-c', 'generated.f90'] + lib_files 
+            + ['--build-dir', 'build', '--f90flags="-Wno-unused-dummy-argument"']
+            ,
+            env=env, cwd=self.tempdir,
+            stdout=subprocess.PIPE,
+            # stderr=subprocess.PIPE 
+            # stdout=subprocess.DEVNULL,
+            # stderr=sys.stderr
+        )
+        if ret.returncode != 0:
+            print('======================== Compilation failed ========================')
+            # print(ret.stdout.decode())
+            raise RuntimeError(f'Compilation failed with return code {ret.returncode}')
+        
+        sofile = next(p for p in os.listdir(self.tempdir) if p.startswith(generated_name) and p.endswith('.so'))
+        so_fullpath = os.path.join(self.tempdir, sofile)
+
+        spec = importlib.util.spec_from_file_location(generated_name, so_fullpath)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        return module
+
                 
     def print_jacobian(self):
         J: list[list[Expr]] = []
