@@ -115,6 +115,30 @@ class Euler(Integrator):
             self.system.equate(x.at(self.index, self.index + 1), x + step * k, 
                                label=f'{{{self.name}}}_{{{x.name}}}', 
                                manipulate=False)
+            
+class BackwardEuler(Integrator):
+
+    step: expr_type
+
+    def __init__(self, step):
+        self.step = step
+        self.name = 'BackwardEuler'
+
+    def step_equations(self, replace_equation: Callable[[tuple[sp.Expr, ...], tuple[sp.Expr, ...], str], None]):
+        step = cast(sp.Expr, self.system(self.step))
+
+        K: list[Function] = []
+        for dx in self.dX:
+            k_name = f'{{k_{{{dx.name}}}}}'
+            self.system.add_variable(k_name, index=tuple(dx.index.keys()))
+            K.append(self.system[k_name])
+
+        replace_equation(self.X, tuple(K), 'K')
+
+        for x, k in zip(self.X, K):
+            self.system.equate(x.at(self.index, self.index + 1), x + step * k.at(self.index, self.index + 1), 
+                               label=f'{{{self.name}}}_{{{x.name}}}', 
+                               manipulate=False)
     
 class RK2(Integrator):
 

@@ -115,6 +115,9 @@ class Function(spf.AppliedUndef):
         return self.make(self.name, index=self._index, base_space=self._base_space,
                          space=self._space)
     
+    def index_mapping(self) -> dict[Index, Expr]:
+        return { i: self.index[i] for i in self._index if i != self.index[i] }
+    
     # Get Info
 
     def is_bound(self, index: Optional[Index]) -> bool:
@@ -353,4 +356,7 @@ class Equation(spr.Equality):
         return { s for s in self.lhs.atoms(spf.AppliedUndef) 
                             | self.rhs.atoms(spf.AppliedUndef)
                 if isinstance(s, Symbol) } #type:ignore
+    
+    def __repr__(self):
+        return f'{self._label}: {self.lhs} = {self.rhs}'
     

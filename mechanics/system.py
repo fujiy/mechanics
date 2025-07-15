@@ -20,14 +20,15 @@ class System:
 
     _base_space:  list[BaseSpace]
     _indices:     list[Index]
-    _coordinates: list[Function]
     _functions:   list[Function]
+    _coordinates: list[Function]
+    _constants:   list[Function]
     _definitions: dict[str, Expr]
     _equations:   dict[str, Equation]
 
     _history:    list[Basic] = []
 
-    def __init__(self, space: Optional[name_type] = 't'):
+    def __init__(self, space: Optional[name_type] = None):
         
 
         self._dict = {}
@@ -36,8 +37,9 @@ class System:
 
         self._base_space  = []
         self._indices     = []
-        self._coordinates = []
         self._functions   = []
+        self._coordinates = []
+        self._constants   = []
         self._definitions = {}
         self._equations   = {}
         
@@ -118,6 +120,7 @@ class System:
                      index: Union[name_type, tuple_ish[Index], None] = None,
                      **options) -> Self:
         constants = self.__add_function(name, index=index, base_space=(), **options)
+        self._constants.extend(constants)
         self.__add_history(to_single_or_tuple(constants))
         return self
 
@@ -195,7 +198,7 @@ class System:
             raise ValueError(f'Number of lhs and rhs must be the same, {({len(expr)})} vs {({len(rhs)})}')
 
         if label: label_ = to_tuple(label)
-        else:     label_ = [f'eq{len(self._equations)}']
+        else:     label_ = [f'Eq_{len(self._equations)}']
         if len(label_) != len(expr): 
             if len(label_) == 1: 
                 label_ = [label_[0] + f'_{i}' for i in range(len(expr))]
@@ -262,6 +265,8 @@ class System:
 
     def state_space(self, time: Optional[name_type] = None) -> tuple[Expr, ...]:
         if time is None:
+            if not self._base_space:
+                return tuple()
             time_ = self.base_space[0]
         else:
             time_ = cast(BaseSpace, self[time])
@@ -321,17 +326,12 @@ class System:
                   if isinstance(s, Function) }
     
     def is_constant(self, expr: expr_type) -> bool:
-        exprs = self(expr, return_as_tuple=True, simplify=False, collect=False)
-        result = True
+        exprs = self(expr, return_as_tuple=True, manipulate=False)
+        constants = set(self.constants)
         for expr in exprs: #type:ignore
-            if isinstance(expr, Function):
-                if expr.base_space:
-                    result = False
-                    break
-            else:
-                result = False
-                break
-        return result
+            if self.dependencies_of(expr) - constants:
+                return False
+        return True
 
     # Access
     
@@ -399,7 +399,7 @@ class System:
         -> Union[Basic, tuple[Basic, ...]]:
         expr_: Union[Basic, tuple[Basic, ...]]
         if isinstance(expr, str): 
-            expr_ = eval(expr, globals() | self._builtins, self._dict)
+            expr_ = eval(expr, globals() | self._builtins, self._dict | self.__history_map())
         else:
             expr_ = expr
         if sum_for:
@@ -493,6 +493,13 @@ class System:
     def __add_history(self, value: Any):
         self._history.append(value)
 
+    def __history_map(self) -> dict[str, Any]:
+        history_map = {}
+        for n in range(1, 4):
+            if len(self._history) <= n:
+                return history_map
+            history_map['_' * n] = self._history[-n]
+        return history_map
 
     # Discretization
 
@@ -511,43 +518,46 @@ class System:
         expr_ = self(expr, manipulate=None, **options)
         return LatexPrinterModified(self).doprint(expr_)
     
-    def show(self, expr: expr_type, label: str = '', **options) -> Self:
+    def show(self, expr: Optional[expr_type] = None, label: str = '', label_str: str = '', **options) -> Self:
         from IPython.display import display, Math #type:ignore
         options = {'manipulate': None} | options
-        expr_ = self(expr, **options) #type:ignore
+        message = ''
         if label:
-            display(Math(label + ': ' + self.latex(expr_)))
-        else:
-            display(Math(self.latex(expr_)))
+            message += label
+        elif label_str:
+            message += r'\mathrm{' + label_str + '}'
+        if (label or label_str) and expr is not None:
+            message += ':'
+        if expr is not None:
+            message += self.latex(self(expr, **options)) #type:ignore
+        display(Math(message))
         return self
 
     def show_all(self) -> Self:
         from IPython.display import display, Math #type:ignore
 
-        if len(self.coordinates) == 1:
-            coords = self.latex(self.coordinates[0])
-        else:
-            coords = '(' + ', '.join([ self.latex(q) for q in self.coordinates ]) + ')'
-        display(Math('Q = ' + self.configuration + r' \ni ' + coords))
+        if len(self.coordinates) > 0:
+            if len(self.coordinates) == 1:
+                coords = self.latex(self.coordinates[0])
+            else:
+                coords = '(' + ', '.join([ self.latex(q) for q in self.coordinates ]) + ')'
+            display(Math('Q = ' + self.configuration + r' \ni ' + coords))
 
         if self.constants:
-            display(Math(r'\mathrm{constants}: ' 
-                         + ', '.join([ self.latex(c) for c in self.constants ])))
+            self.show(self.constants, label_str='Constants')
 
         if self.variables:
-            display(Math(r'\mathrm{variables}: '
-                            + ', '.join([ self.latex(v) for v in self.variables ])))
+            self.show(self.variables, label_str='Variables')
 
         if self.definitions:
-            display(Math(r'\mathrm{definitions}:'))
+            self.show(label_str='Definitions:')
             for f, definition in self.definitions.items():
-              display(Math(f'{self.latex(f)} = {self.latex(definition)}'))
-
+                self.show(sp.Eq(f, definition))
 
         if self.equations:
-            display(Math(r'\mathrm{equations}:'))
+            self.show(label_str='Equations')
             for label, eq in self.equations.items():
-                display(Math(f'\mathrm{{{label}}}: {self.latex(eq.lhs)} = {self.latex(eq.rhs)}'))
+                self.show(eq, label=label)
 
         return self
     
@@ -572,15 +582,15 @@ class System:
     
     @property
     def variables(self) -> tuple[Function, ...]:
+        # return tuple(set(self._functions) - set(self._constants) - set(self._coordinates) - set(self._definitions.keys()))
         return tuple(v for v in self._functions
-                     if not self.is_constant(v) 
+                     if v not in self._constants
                         and v not in self._coordinates
                         and v.name not in self._definitions)
     
     @property
     def constants(self) -> tuple[Function, ...]:
-        return tuple(v for v in self._functions
-                     if self.is_constant(v) and v not in self._coordinates)
+        return tuple(self._constants) 
     
     @property
     def definitions(self) -> dict[Function, Expr]:
