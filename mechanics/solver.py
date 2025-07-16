@@ -1,3 +1,4 @@
+import datetime
 from typing import cast, Any, Optional
 from collections import defaultdict
 import tempfile
@@ -52,11 +53,23 @@ class FortranPrinter(sympy.printing.fortran.FCodePrinter):
     
         
 class Result:
-    def __init__(self, system: System):
+    def __init__(self, system: System, 
+                 directory: Optional[str] = None, 
+                 name: Optional[str] = None):
         self.system = system
 
         self.newton_converged_iters = []
         self._dict = {}
+
+        if not directory:
+            directory = os.path.join(os.getcwd(), 'result')
+        if not name:
+            now = datetime.datetime.now()
+            name = now.strftime('%Y%m%d_%H%M%S')
+           
+        self.path = os.path.join(directory, name, '')
+            
+        os.makedirs(self.path, exist_ok=True)
 
     def set_data(self, keys, values, N=None):
         if N:
@@ -126,20 +139,20 @@ class Block:
         subroutine block_{self.id}_equation({args}, eq)
             use constants
             implicit none
-            real(8), dimension(0:{self.dim}-1), intent(out) :: eq'''
+            real(8), dimension({self.dim}), intent(out) :: eq'''
         for v in self.unknowns + self.knowns:
             code += f'''
             real(8), intent(in) :: {v.name}'''
         for i, eq in enumerate(self.equations):
             code += f'''
-            eq({i}) = {printer.doprint(eq.lhs - eq.rhs)} ! {eq.label}'''
+            eq({i+1}) = {printer.doprint(eq.lhs - eq.rhs)} ! {eq.label}'''
         code += f'''
         end subroutine block_{self.id}_equation
 
         subroutine block_{self.id}_jacobian({args}, jac)
             use constants
             implicit none
-            real(8), dimension(0:{self.dim}-1, 0:{self.dim}-1), intent(out) :: jac'''
+            real(8), dimension({self.dim}, {self.dim}), intent(out) :: jac'''
         for v in self.unknowns + self.knowns:
             code += f'''
             real(8), intent(in) :: {v.name}'''
@@ -147,7 +160,7 @@ class Block:
             for j, v in enumerate(self.unknowns):
                 if v in self.jacobian[eq]:
                     code += f'''
-            jac({i}, {j}) = {printer.doprint(self.jacobian[eq][v])} ! d({eq.label})/d({v.name})'''
+            jac({i+1}, {j+1}) = {printer.doprint(self.jacobian[eq][v])} ! d({eq.label})/d({v.name})'''
 
         code += f'''
         end subroutine block_{self.id}_jacobian
@@ -188,7 +201,7 @@ class Solver:
             for unk_dep in unknowns[dep.var]:
                 assert unk_dep.var == dep.var
                 if unk_dep.eq == dep.eq: continue
-                if unk_dep.eq in searched_eqs: return []
+                if unk_dep.eq in searched_eqs: continue
 
                 # print(f'  {dep};  unk_dep: {unk_dep}')
                 if unk_dep.matching:
@@ -197,7 +210,7 @@ class Solver:
                     for more_dep in equations[unk_dep.eq]:
                         assert more_dep.eq == unk_dep.eq
                         if more_dep.var == unk_dep.var: continue
-                        if more_dep.var in searched_vars: return []
+                        if more_dep.var in searched_vars: continue
 
                         # print(f'  {dep}; more_dep: {more_dep}')
                         unk_matching = True
@@ -223,6 +236,7 @@ class Solver:
                     for p in path:
                         p.matching = not p.matching
                     break
+            # print(eq.label)
             # self.plot_dependencies()
 
         matched: list[Dependency] = []
@@ -369,6 +383,8 @@ class Solver:
         printer = FortranPrinter({'source_format': 'free', 'strict': False, 'standard': 95, 'precision': 15})
         
         dim_max = max([block.dim for block in blocks])
+
+        condition_dim = len(self.constants)
     
         code = ''
         code += f'''
@@ -393,7 +409,7 @@ class Solver:
         code += f'''
         end module blocks
                                 
-        subroutine run_solver(status, message)
+        subroutine run_solver(log_path, condition, status, message)
             use, intrinsic :: ieee_arithmetic
             use constants
             use variables
@@ -402,13 +418,18 @@ class Solver:
             double precision dnrm2
             external dnrm2
 
+            character(len=*), intent(in) :: log_path
+            real(8), dimension({condition_dim}), intent(in) :: condition
             integer, intent(out) :: status
             character(len=100), intent(out) :: message
+
+            integer :: log_unit
+            integer :: ios
             
-            real(8), dimension(0:{dim_max}-1) :: eq
-            real(8), dimension(0:{dim_max}-1,0:{dim_max}-1) :: jac
-            real(8), dimension(0:{dim_max}-1) :: vars
-            integer, dimension({dim_max}-1) :: ipiv
+            real(8), dimension({dim_max}) :: eq
+            real(8), dimension({dim_max},{dim_max}) :: jac
+            real(8), dimension({dim_max}) :: vars
+            integer, dimension({dim_max}) :: ipiv
             integer :: info
             real(8) :: residual
             integer :: newton_iter
@@ -416,7 +437,15 @@ class Solver:
             integer :: i
                                 
             print *, "Started"
-                                '''
+            print *, "Output in ", log_path
+
+            open(unit=log_unit, file=log_path//"log.bin", form='unformatted',&
+                 access='stream', status='replace', iostat=ios)
+            if (ios /= 0) then
+               print *, "Error opening file: ", log_path//"log.bin"
+               stop 1
+            end if
+        '''
         for block in blocks:
             args = ', '.join([v.name for v in block.unknowns + block.knowns])
             code += f'''
@@ -434,7 +463,7 @@ class Solver:
                 '''
             for i, v in enumerate(block.unknowns):
                 code += f'''
-                {v.name} = {v.name} - eq({i})'''
+                {v.name} = {v.name} - eq({i+1})'''
             code += f'''
                 call block_{block.id}_equation({args}, eq)
 
@@ -455,9 +484,15 @@ class Solver:
                 print "('  Block {block.id} converged in ', i3, ' iterations, residual = ', E10.4)", newton_iter, residual
             end if
             '''
+
+        for v in self.variables:
+            code += f'''
+            write (log_unit) {v.name}'''
             
         code += f'''
+
             print *, "Completed"
+            close(log_unit)
         end subroutine run_solver
         '''
         code = textwrap.dedent(code)
@@ -467,150 +502,38 @@ class Solver:
 
         self.module = self.compile_and_load(code, [])
 
-        return
-
-
-
-        # Collect unknowns from definitions and equations
-
-        unknowns_: set[Function] = set()
-
-        for f, definition in system.definitions.items():
-            unknowns_.update({v for v in self.system.dependencies_of(definition) 
-                              if not system.is_constant(v)})
-        for eq in system.equations.values():
-            unknowns_.update({v for v in self.system.dependencies_of(eq) 
-                              if not system.is_constant(v)})
-        for v in self.input:
-            if v in unknowns_:
-                unknowns_.remove(v)
-
-        for v in unknowns_.copy():
-            if self.system[v.name] in self.system.definitions:
-                unknowns_.remove(v)
-
-        unknowns = set()
-        for u in unknowns_:
-            already_exixts = False
-            # for v in unknowns.copy():
-                # if v.is_general_form_of(u): 
-                #     already_exixts = True
-                #     break
-                # if u.is_general_form_of(v): 
-                #     unknowns.remove(v)
-                #     break
-            if not already_exixts: 
-                unknowns.add(u)
-
-        self.unknowns = list(unknowns)
-
-        self.system.show(self.unknowns, label_str='Unknowns')
-        # print(f'Variables: {self.variables}')
-
-        indices: list[tuple[Index, ...]] = []
-
-        self.equations: dict[str, Expr] = {}
-        self.definitions: dict[Function, Expr] = {}
-
-        for eq in system.equations.values():
-            equation = eq.lhs - eq.rhs #type:ignore
-            self.equations[eq.label] = cast(Expr, self.system.eval(equation))
-            indices.append(self.system.free_index_of(equation))
-
-        for f, definition in system.definitions.items():
-            if self.system.dependencies_of(definition) & set(self.unknowns):
-                self.equations[f.name] = self.system.eval(f - definition) # type:ignore
-            else: 
-                self.definitions[f] = definition
-
-        self.jacobian = {}
-        for name, eq in self.equations.items():
-            derivatives = {}
-            for v in unknowns:
-                derivative = sp.diff(eq, v)
-                if derivative != 0:
-                    derivatives[v] = derivative
-            if derivatives:
-                self.jacobian[name] = derivatives
-
-        # print(indices)
-        print(f'Equations: {len(self.equations)}, unknowns: {len(unknowns)}, definitions: {len(system.definitions)}')
-        
-        printer = PythonPrinter()
-
-        args_str = ' '.join([python_name(v.name) + ',' for v in self.constants + self.indices + self.variables])
-        constants_str = ' '.join([python_name(v.name) + ',' for v in self.constants])
-        definitions_str = ' '.join([python_name(f.name) + ',' for f in self.definitions.keys()])
-
-        definitions_str = f'def definitions_generated({args_str} {definitions_str}):\n'
-        for i, (f, definition) in enumerate(self.definitions.items()):
-            definitions_str += f'  {printer.doprint(f)} = {printer.doprint(definition)}  # {name} \n'
-        definitions_str += f'  pass\n'
-
-        equations_str = f'def equations_generated({args_str} _):\n'
-        for i, (name, eq) in enumerate(self.equations.items()):
-            equations_str += f'  _[{i}] = {printer.doprint(eq)}  # {name} \n'
-        equations_str += f'  pass\n'
-
-        unknowns_indices = {v: i for i, v in enumerate(self.unknowns)}
-
-        variables_set = set(self.variables)
-        self.jacobian_rows = []
-        self.jacobian_cols = []
-        jacobian_str = f'def jacobian_generated({args_str} _):\n'
-        jacobian_initial_str = f'def jacobian_initial({constants_str} _):\n'
-        n = 0
-        for i, (name, derivatives) in enumerate(self.jacobian.items()):
-            for v, derivative in derivatives.items():
-                j = unknowns_indices[v]
-                if derivative == 0:
-                    continue
-                self.jacobian_rows.append(i)
-                self.jacobian_cols.append(j)
-                if self.system.dependencies_of(derivative) & variables_set:
-                    jacobian_str += f'  _[{n}] = {printer.doprint(derivative)} # (d/d {v.name}) {name} \n'
-                else:
-                    jacobian_initial_str += f'  _[{n}] = {printer.doprint(derivative)}\n'
-                n += 1
-        jacobian_str += f'  pass\n'
-        jacobian_initial_str += f'  pass\n'
-
-        setter_str = f'def setter_generated({args_str} _):\n'
-        for i, unknown in enumerate(self.unknowns):
-            setter_str += f'  {printer.doprint(unknown)} = _[{i}]\n'
-
-        print(f'Jacobian: {list(zip(self.jacobian_rows, self.jacobian_cols))}')
-        print(definitions_str)
-        print(equations_str)
-        print(jacobian_str)
-        print(jacobian_initial_str)
-        print(setter_str)
-
-        exec(definitions_str, globals())
-        exec(equations_str, globals())
-        exec(jacobian_str, globals())
-        exec(jacobian_initial_str, globals())
-        exec(setter_str, globals())
-
-        self.definitions_generated = definitions_generated #type:ignore
-        self.equations_generated = equations_generated #type:ignore
-        self.jacobian_generated = jacobian_generated #type:ignore
-        self.jacobian_initial_generated = jacobian_initial #type:ignore
-        self.setter_generated = setter_generated #type:ignore
-
     # def __del__(self):
     #     shutil.rmtree(self.tempdir)
 
-    def run(self, condition: dict[name_type, float], 
-            newton_max_iter: int = 100, newton_tol: float = 1e-8,
-            initial_epsilon: float = 1e-6) -> Result:
-        condition_ = { self.system(name): value for name, value in condition.items()}
+    def run(self, 
+            condition: dict[name_type, float], 
+            directory: Optional[str] = None,
+            name: Optional[str] = None,
+            newton_max_iter: int = 100, 
+            newton_tol: float = 1e-8) -> Result:
 
-        status, message = self.module.run_solver()
+        condition_ = { self.system(name): value for name, value in condition.items() }
+
+        lack_constants = [c for c in self.constants if c not in condition_]
+        if lack_constants:
+            raise ValueError(f'Value of {lack_constants} must be provided in condition')
+
+        condition_values = np.array([ condition_[c] for c in self.constants ] + [0])
+
+        result = Result(self.system, directory=directory, name=name)
+
+        status, message = self.module.run_solver(result.path, condition_values)
         if status != 0:
             raise RuntimeError(message.decode('utf-8'))
 
-        return
+        result.set_data(self.constants, condition_values)
+        
+        with open(os.path.join(result.path, 'log.bin'), 'rb') as f:
+            log_data = np.fromfile(f, dtype=np.float64)
+            result.set_data(self.variables, log_data)
+        
+
+        return result
 
         index = self.indices[0]
         index_start = index.min or 0

@@ -135,4 +135,6 @@ dmypy.json
 cython_debug/
 
 
+examples/result/
+
 .DS_Store
