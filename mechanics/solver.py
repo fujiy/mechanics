@@ -173,6 +173,11 @@ class Block:
         self.depends_on = depends_on
 
         self.dim = len(self.equations)
+        assert self.dim == len(self.unknowns)
+
+        self.explicit = None
+        if self.dim == 1:
+            self.explicit = {self.unknowns[0]: sp.solve(self.equations[0].lhs - self.equations[0].rhs, self.unknowns[0])[0]}
 
         self.jacobian: defaultdict[Equation, dict[Function, Expr]] = defaultdict(dict)
         for eq in self.equations:
@@ -186,57 +191,88 @@ class Block:
 
         # print(self.jacobian)
 
-    def generate_fortran_args(self, printer: FortranPrinter) -> str:
+    def generate_code(self, printer: FortranPrinter) -> str:
+        p = printer.doprint
+        pn = printer.print_name
+
+        if self.explicit is not None:
+            code = f'''
+
+            ! ======================== Block {self.id} ========================
+            '''
+            for v, expr in self.explicit.items():
+                code += f'''
+            {p(v)} = {p(expr)} ! {v.name}'''
+        
+        else:
+            code = f'''
+            ! ======================== Block {self.id} ========================
+            '''
+            for i, v in enumerate(self.unknowns):
+                if v.index:
+                    cond = ' .and. '.join(f'{p(i.min)} .lt. {p(value)}' for i, value in v.index.items())
+                    previous = [(i, value - 1) for i, value in v.index.items()] # type:ignore
+                    code += f'''
+            if ({cond}) then
+                {p(v)} = {p(v.general_form().subs(previous))}
+            end if'''
+
+            code += f'''
+
+            jac = 0
+
+            do newton_iter = 1, 100
+            '''
+            for i, eq in enumerate(self.equations):
+                code += f'''
+                eq({i+1}) = {printer.doprint(eq.lhs - eq.rhs)} ! {eq.label}'''
+
+            code += f'''
+
+                residual = dnrm2({self.dim}, eq, 1)
+
+                if (ieee_is_nan(residual)) then
+                    write(message, '("Block {self.id}, nan: ", i5, E10.4)') newton_iter, residual
+                    status = 1
+                    return
+                end if
+                if (residual < tol) exit
+                '''
+            for i, eq in enumerate(self.equations):
+                for j, v in enumerate(self.unknowns):
+                    if v in self.jacobian[eq]:
+                        code += f'''
+                jac({i+1}, {j+1}) = {printer.doprint(self.jacobian[eq][v])}'''
+
+            code += f'''
+                ! print *, "Block {self.id}"
+                ! print *, "eq", eq
+                ! print *, "jac", jac
+
+                call dgesv({self.dim}, 1, jac, {self.dim}, ipiv, eq, {self.dim}, info)
+                if (info /= 0) then
+                    write(message, '("Block {self.id}, dgesv error: ", i5)') info
+                    status = 1
+                    return
+                end if
+                '''
+            for i, v in enumerate(self.unknowns):
+                code += f'''
+                {p(v)} = {p(v)} - eq({i+1})'''
+            code += f'''
+            end do
+            if (residual >= tol) then
+                write(message, '("Block {self.id} not converging: ", i5, ", ", E10.4)') newton_iter, residual
+                status = 1
+                return
+            end if
+            '''
+
+        return code
+
+    def generate_args(self, printer: FortranPrinter) -> str:
         args = ', '.join([printer.print_name(v) for v in self.indices + self.variables + self.knowns])
         return args
-
-    def generate_fortran(self, printer: FortranPrinter) -> str:
-        args = self.generate_fortran_args(printer)
-        code = f'''
-        subroutine block_{self.id}_equation({args}, eq)
-            use constants
-            implicit none
-            real(8), intent(out) :: eq(:)'''
-        for i in self.indices:
-            code += f'''
-            integer, intent(in) :: {printer.print_name(i)}'''
-        for v in self.variables + self.knowns:
-            code += f'''
-            real(8), intent(in) :: {printer.print_as_array_arg(v)}'''
-
-        # for v in self.variables + self.knowns:
-        #     code += f'''
-        #     print *, "range: {printer.print_name(v)}, ", lbound({printer.print_name(v)}), ubound({printer.print_name(v)})'''
-        # for v in self.unknowns:
-        #     code += f'''
-        #     print *, "output: {printer.doprint(v)}, ", {printer.doprint(v)}, F_i'''
-
-        for i, eq in enumerate(self.equations):
-            code += f'''
-            eq({i+1}) = {printer.doprint(eq.lhs - eq.rhs)} ! {eq.label}'''
-        code += f'''
-        end subroutine block_{self.id}_equation
-
-        subroutine block_{self.id}_jacobian({args}, jac)
-            use constants
-            implicit none
-            real(8), intent(out) :: jac(:,:)'''
-        for i in self.indices:
-            code += f'''
-            integer, intent(in) :: {printer.print_name(i)}'''
-        for v in self.unknowns + self.knowns:
-            code += f'''
-            real(8), intent(in) :: {printer.print_as_array_arg(v)}'''
-        for i, eq in enumerate(self.equations):
-            for j, v in enumerate(self.unknowns):
-                if v in self.jacobian[eq]:
-                    code += f'''
-            jac({i+1}, {j+1}) = {printer.doprint(self.jacobian[eq][v])}'''
-
-        code += f'''
-        end subroutine block_{self.id}_jacobian
-        '''
-        return textwrap.dedent(code)
 
     def __repr__(self) -> str:
         return \
@@ -563,7 +599,7 @@ class Solver:
             integer, save :: {pn(c)} = 0'''
             else: 
                 code += f'''
-            real(8), save :: {pn(c)} = 0.0'''
+            real(8), save :: {pn(c)} = 0.0d0'''
         code += f'''
         end module constants
 
@@ -573,21 +609,10 @@ class Solver:
             integer, save :: {pn(i)} = 0'''
         code += f'''
         end module indices
-
-        module blocks
-        contains
-        '''
-
-        for block in stages[0].blocks:
-            code += textwrap.indent(block.generate_fortran(printer), ' '*12)
-
-        code += f'''
-        end module blocks
                                 
         subroutine run_solver(log_path, condition, status, message)
             use, intrinsic :: ieee_arithmetic
             use constants
-            use blocks
             implicit none
             double precision dnrm2
             external dnrm2
@@ -682,72 +707,7 @@ class Solver:
             '''
 
         for block in stages[0].blocks:
-            args = block.generate_fortran_args(printer)
-            code += f'''
-            ! ======================== Block {block.id} ========================
-            '''
-            for i, v in enumerate(block.unknowns):
-                if v.index:
-                    cond = ' .and. '.join(f'{p(i.min)} .lt. {p(value)}' for i, value in v.index.items())
-                    previous = [(i, value - 1) for i, value in v.index.items()] # type:ignore
-                    code += f'''
-            if ({cond}) then
-                {printer.doprint(v)} = {printer.doprint(v.general_form().subs(previous))}
-            end if'''
-
-            code += f'''
-
-            jac = 0
-
-            call block_{block.id}_equation({args}, eq)
-
-            do newton_iter = 1, 10
-
-                call block_{block.id}_jacobian({args}, jac)
-
-                ! print *, "Block {block.id}"
-                ! print *, "eq", eq
-                ! print *, "jac", jac
-
-                ! jac * r = eq; eq = r
-                call dgesv({block.dim}, 1, jac, {block.dim}, ipiv, eq, {block.dim}, info)
-                if (info /= 0) then
-                    write(message, '("Block {block.id}, dgesv error: ", i5)') info
-                    status = 1
-                    return
-                end if
-                '''
-            for i, v in enumerate(block.unknowns):
-                code += f'''
-                ! print *, "old ", "{pn(v)}", {pn(v)} 
-                {printer.doprint(v)} = {printer.doprint(v)} - eq({i+1})
-                ! print *, "new ", "{pn(v)}", {pn(v)} 
-                '''
-            code += f'''
-
-                ! print *, "red", eq
-
-                call block_{block.id}_equation({args}, eq)
-
-                ! print *, "new_eq", eq
-
-                residual = dnrm2({block.dim}, eq, 1)
-
-                if (ieee_is_nan(residual)) then
-                    write(message, '("Block {block.id}, nan: ", i5, E10.4)') newton_iter, residual
-                    status = 1
-                    return
-                end if
-                if (residual < tol) exit
-            end do
-            if (residual >= tol) then
-                write(message, '("Block {block.id} not converging: ", i5, ", ", E10.4)') newton_iter, residual
-                status = 1
-                return
-            else
-                ! print "('  Block {block.id} converged in ', i3, ' iterations, residual = ', E10.4)", newton_iter, residual
-            end if
-            '''
+            code += block.generate_code(printer)
 
         for i in self.indices:
             code += f'''
@@ -820,26 +780,24 @@ class Solver:
         for c in self.constants:
             result.set_data(c, condition_[c])
         
-        with open(os.path.join(result.path, 'log.bin'), 'rb') as f:
-            log_data = np.fromfile(f, dtype=np.float64)
-            # print('Log data:', log_data)
+        log_data = np.memmap(os.path.join(result.path, 'log.bin'), dtype=np.float64, mode='r')
 
-            ranges = { i: (sp.sympify(i.min).subs(condition_), sp.sympify(i.max).subs(condition_)) for i in self.indices }
-            sizes = { i: r[1] - r[0] + 1 for i, r in ranges.items() }
+        ranges = { i: (sp.sympify(i.min).subs(condition_), sp.sympify(i.max).subs(condition_)) for i in self.indices }
+        sizes = { i: r[1] - r[0] + 1 for i, r in ranges.items() }
 
-            for i in self.indices:
-                result.set_data(i, range(ranges[i][0], ranges[i][1] + 1))
+        for i in self.indices:
+            result.set_data(i, range(ranges[i][0], ranges[i][1] + 1))
 
-            offset = 0
-            for v in self.variables + tuple(self.system.definitions.keys()):
-                if v.index:
-                    size = np.prod([sizes[i] for i in v.index])
-                    values = log_data[offset:offset + size].reshape(*[sizes[i] for i in v.index])
-                    offset += size
-                    result.set_data(v, values)
-                else:
-                    result.set_data(v, log_data[offset])
-                    offset += 1
+        offset = 0
+        for v in self.variables + tuple(self.system.definitions.keys()):
+            if v.index:
+                size = np.prod([sizes[i] for i in v.index])
+                values = log_data[offset:offset + size].reshape(*[sizes[i] for i in v.index])
+                offset += size
+                result.set_data(v, values)
+            else:
+                result.set_data(v, log_data[offset])
+                offset += 1
         
         return result
     
@@ -948,6 +906,13 @@ class Solver:
             #     G.add_edge('Input', block.id)
             for depends_on in block.depends_on:
                 G.add_edge(depends_on.id, block.id)
+        color_map = []
+        for block_id in G.nodes:
+            block = [block for block in stage.blocks if block.id == block_id][0]
+            if block.explicit is None:
+                color_map.append('lightcoral')
+            else:
+                color_map.append('lightblue')
 
         from networkx.algorithms.dag import topological_sort
         import random
@@ -960,7 +925,7 @@ class Solver:
             G, pos,
             with_labels=True,
             labels=labels,
-            node_color='lightblue',
+            node_color=color_map,
             node_size=2000,
             font_size=10,
             arrows=True
