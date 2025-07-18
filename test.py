@@ -19,7 +19,7 @@ system_d = (
     # .add_constant('h')
     # .add_constant('N', space=Z)
     .uniform_space('t', 'i', 0, 'N', 'h')
-    .apply(Euler('h'))
+    .apply(RK4('h'))
     .doit()
 )
 system_d.show_all()
@@ -31,7 +31,7 @@ result = solver.run({
     'l': 1,
     'm': 1,
     'g': 1,
-    'N': 10,
+    'N': 10000,
     'h': 0.01,
     'theta[0]': np.pi/4,
     'dottheta[0]': 0,

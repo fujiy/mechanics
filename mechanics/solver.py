@@ -20,7 +20,6 @@ import sympy as sp
 import sympy.printing.fortran
 import matplotlib.pyplot as plt
 from sympy.printing.numpy import SciPyPrinter
-import networkx as nx
 
 from mechanics.system import System
 from mechanics.symbol import Function, Expr, Index, Equation, Union
@@ -162,13 +161,16 @@ class Block:
                  variables: list[Function],
                  unknowns: list[Function], 
                  knowns: list[Function],
-                 indices: list[Index]):
+                 indices: list[Index],
+                 depends_on: list['Block']
+                 ):
         self.id = id
         self.equations = equations
         self.variables = variables
         self.unknowns = unknowns
         self.knowns = knowns
         self.indices = indices
+        self.depends_on = depends_on
 
         self.dim = len(self.equations)
 
@@ -182,7 +184,7 @@ class Block:
             if derivatives:
                 self.jacobian[eq] = derivatives
 
-        print(self.jacobian)
+        # print(self.jacobian)
 
     def generate_fortran_args(self, printer: FortranPrinter) -> str:
         args = ', '.join([printer.print_name(v) for v in self.indices + self.variables + self.knowns])
@@ -237,7 +239,24 @@ class Block:
         return textwrap.dedent(code)
 
     def __repr__(self) -> str:
-        return f'Block #{self.id}(equations={tuple(eq.label for eq in self.equations)}, variables={self.variables}, unknowns={self.unknowns}), knowns={self.knowns}, indices={self.indices})'
+        return \
+            f'Block #{self.id} {self.indices} <- {tuple(f"#{b.id}" for b in self.depends_on)}\n'\
+            f'    equations = {tuple(eq.label for eq in self.equations)}\n'\
+            f'    variables = {self.variables}\n'\
+            f'    unknowns  = {self.unknowns}\n'\
+            f'    knowns    = {self.knowns}\n'
+    
+class Stage:
+    def __init__(self, indices: dict[Index, Expr], inputs: list[Function], blocks: list[Block]):
+        self.indices = indices
+        self.inputs = inputs
+        self.blocks = blocks
+
+    def __repr__(self) -> str:
+        s = f'Stage(indices={self.indices}, inputs={self.inputs})):\n'
+        for block in self.blocks:
+            s += f'  {block}\n'
+        return s
 
 Node = Union[Equation, Function]
 def show_node(node: Node) -> str:
@@ -411,12 +430,15 @@ class Solver:
                     else:
                         # assert node in self.unknowns
                         variables.append(cast(Function, node))
+                knowns = knowns - set(variables)
+                depends_on = [ block for block in blocks if set(block.variables) & knowns]
                 block = Block(block_id, 
                               equations, 
                               variables,
                               [output_indexed[v] for v in variables],
-                              list(knowns - set(variables)), 
-                              list(self.indices))
+                              list(knowns), 
+                              list(self.indices),
+                              depends_on)
                 blocks.append(block)
                 block_id += 1
             # print('visited_second', visited_second)
@@ -467,17 +489,6 @@ class Solver:
                                    itertools.product(*[[(i, i.min), (i, i), (i, i.max)] 
                                    for i in self.indices]))
         print('Index combinations:', index_combinations)
-        class Stage:
-            def __init__(self, indices: dict[Index, Expr], inputs: list[Function], blocks: list[Block]):
-                self.indices = indices
-                self.inputs = inputs
-                self.blocks = blocks
-
-            def __repr__(self) -> str:
-                s = f'Stage(indices={self.indices}, inputs={self.inputs})):\n'
-                for block in self.blocks:
-                    s += f'  {block}\n'
-                return s
 
         stages: list[Stage] = []
 
@@ -515,7 +526,7 @@ class Solver:
                     if v_in.at(i, i+1) not in output:
                         input_in_output = False
                         break
-            print(input_in_output)
+            # print(input_in_output)
 
             blocks = self.block_decomposition(dependencies, inputs)
             # for block in blocks:
@@ -524,7 +535,8 @@ class Solver:
             stage = Stage(index_combo, list(inputs), blocks)
             
             stages.append(stage)
-            print(stage)
+            # print(stage)
+            self.plot_stage(stage)
 
             if input_in_output:
                 break
@@ -610,7 +622,7 @@ class Solver:
             real(8), allocatable :: {printer.print_as_array_arg(v)}'''
             else:
                 code += f'''
-            real(8) :: {pn(v)} = 0.0'''
+            real(8) :: {pn(v)} = 0.0d0'''
         code += '\n'
 
         for f in self.system.definitions.keys():
@@ -619,7 +631,7 @@ class Solver:
             real(8), allocatable :: {printer.print_as_array_arg(f)}'''
             else:
                 code += f'''
-            real(8) :: {pn(f)} = 0.0'''
+            real(8) :: {pn(f)} = 0.0d0'''
         code += '\n'
 
         for n, c in enumerate(self.constants):
@@ -631,6 +643,11 @@ class Solver:
             if v.index:
                 code += f'''
             allocate({pn(v)}({",".join(f"{p(i.max - i.min + self.index_margin)}" for i in v.index)}))'''
+        code += '\n'
+
+        for v in self.variables:
+            code += f'''
+            {pn(v)} = 0.0d0'''
         code += '\n'
 
         for f in self.system.definitions.keys():
@@ -673,7 +690,6 @@ class Solver:
                 if v.index:
                     cond = ' .and. '.join(f'{p(i.min)} .lt. {p(value)}' for i, value in v.index.items())
                     previous = [(i, value - 1) for i, value in v.index.items()] # type:ignore
-                    print(block.id, v, previous)
                     code += f'''
             if ({cond}) then
                 {printer.doprint(v)} = {printer.doprint(v.general_form().subs(previous))}
@@ -681,10 +697,11 @@ class Solver:
 
             code += f'''
 
+            jac = 0
+
             call block_{block.id}_equation({args}, eq)
 
             do newton_iter = 1, 10
-                jac = 0
 
                 call block_{block.id}_jacobian({args}, jac)
 
@@ -823,132 +840,7 @@ class Solver:
                 else:
                     result.set_data(v, log_data[offset])
                     offset += 1
-
-            # result.set_data(self.variables, log_data)
         
-
-        return result
-
-        index = self.indices[0]
-        index_start = index.min or 0
-        index_end = index.max or 0
-        if index_start and index_start in condition_:
-            index_start = condition_[index_start]
-        if index_end and index_end in condition_:
-            index_end = condition_[index_end]
-        N = cast(int, index_end) - cast(int, index_start) + 1
-
-        print(f'{index} = {index_start}, ..., {index_end}')
-
-        value_constants = []
-        for v in self.constants:
-            if v in condition_:
-                value_constants.append(condition_[v])
-            else:
-                raise ValueError(f'Value of {v} must be provided in condition')
-            
-        value_indices = []
-        for v in self.indices:
-            value_indices.append(np.arange(index_start, cast(int, index_end) + 1))
-
-        value_variables = []
-        for v in self.variables:
-            if v in self.input:
-                if v in condition_:
-                    values = np.empty((N+1,), dtype=float)
-                    values[:] = np.nan
-                    values[0] = condition_[v]
-                    value_variables.append(values)
-                else:
-                    raise ValueError(f'Value of {v} must be provided in condition')
-            else:
-                values = np.empty((N+1,), dtype=float)
-                values[:] = np.nan
-                values[0] = initial_epsilon * np.random.randn()  # Random initial guess
-                value_variables.append(values)
-
-        value_definitions = []
-        for f, definition in self.definitions.items():
-            value_definitions.append(np.empty((N+1,), dtype=float))
-
-        value_unknowns = np.zeros((len(self.unknowns)), dtype=float)
-        value_equation = np.zeros((len(self.unknowns)), dtype=float)
-        
-        value_jacobian_data = np.zeros(len(self.jacobian_rows))
-        self.jacobian_initial_generated(*value_constants, value_jacobian_data)
-
-        value_jacobian = sparse.coo_matrix((value_jacobian_data, (self.jacobian_rows, self.jacobian_cols)), 
-                                           shape=(len(self.unknowns), len(self.unknowns))).tocsr()
-        
-        # np.zeros((len(self.unknowns), len(self.unknowns)), dtype=float)
-
-        result = Result(self.system)
-
-        psudo_inverse_warning = False
-
-        for i_ in tqdm(value_indices[0]):
-
-            for values in value_variables:
-                if np.isnan(values[i_ + 1]):
-                    values[i_ + 1] = values[i_] # + initial_epsilon * np.random.randn()
-
-            for newton_iter in range(0, newton_max_iter + 1):
-                try:
-                    self.equations_generated(*value_constants,i_,*value_variables, value_equation)
-                    # self.jacobian_generated(*value_constants,i_,*value_variables, value_jacobian)
-                    self.jacobian_generated(*value_constants,i_,*value_variables, value_jacobian_data)
-                    value_jacobian.data = value_jacobian_data
-
-                    # print('vars 0', np.array(value_variables)[:,newton_iter])
-                    # print('vars 1', np.array(value_variables)[:,newton_iter + 1])
-                    # print('equations', value_equation)
-
-
-                    # with np.printoptions(threshold=np.inf):
-                    #     print('jacobian',value_jacobian)
-
-                    # print('jacobian', np.linalg.matrix_rank(value_jacobian), value_jacobian.shape)
-
-                    with warnings.catch_warnings(record=True) as w:
-                        # value_residual = linalg.solve(value_jacobian, value_equation)
-                        warnings.simplefilter("always", category=sparse.linalg.MatrixRankWarning)
-                        value_residual = sparse.linalg.spsolve(value_jacobian, value_equation)
-
-                        if any(issubclass(warning.category, sparse.linalg.MatrixRankWarning) for warning in w):
-
-                            value_jacobian_array = value_jacobian.toarray()
-                            if not psudo_inverse_warning:
-                                psudo_inverse_warning = True
-                                # value_jacobian_array = value_jacobian.toarray()
-                                print(f'warning: Singular matrix encountered in Newton method, using pseudo-inverse. rank: {np.linalg.matrix_rank(value_jacobian_array)} / {value_jacobian_array.shape[0]}')
-                                
-                                # u, s, vh = np.linalg.svd(value_jacobian_array)
-                                # print('Singular values:', s)
-
-                                import matplotlib.pyplot as plt
-                                plt.imshow(value_jacobian.toarray(), cmap='viridis', interpolation='nearest')
-                                plt.colorbar()
-                                plt.show()
-                            value_residual = linalg.pinv(value_jacobian_array) @ value_equation
-                            # value_residual = sparse.linalg.lgmres(value_jacobian, value_equation)[0]
-                        
-                    value_unknowns -= value_residual
-
-                    self.definitions_generated(*value_constants, i_, *value_variables, *value_definitions)
-                    self.setter_generated(*value_constants,i_,*value_variables, value_unknowns)
-
-                    if np.linalg.norm(value_residual) < newton_tol:
-                        result.newton_converged_iters.append(newton_iter)
-                        break
-                    if newton_iter == newton_max_iter:
-                        raise ValueError('Newton did not converge in {newton_max_iter} iterations')
-                except:
-                    raise Exception(f'Exception at index {i_}, iter {newton_iter}')
-
-        result.set_data(self.constants, value_constants)
-        result.set_data(self.variables, value_variables, N=N)
-        result.set_data(self.definitions.keys(), value_definitions, N=N)
-
         return result
     
     def compile_and_load(self, source: str, libs: list[str] = []) -> Any:
@@ -1002,103 +894,8 @@ class Solver:
         
         self.system.show(sp.Matrix(J), label_str='Jacobian') #type:ignore
 
-    def plot_jacobian(self, ticks = True):
-        jacobian_matrix = np.zeros((len(self.equations), len(self.unknowns)), dtype=int)
-        for i, label in enumerate(self.equations):
-            for j, var in enumerate(self.unknowns):
-                J_ij = self.jacobian.get(label, {}).get(var, 0)
-                if J_ij:
-                    if self.system.dependencies_of(J_ij) & set(self.unknowns):
-                        jacobian_matrix[i, j] = 2
-                    else:
-                        jacobian_matrix[i, j] = 1
-
-        plt.figure(figsize=(5, 5))
-        plt.imshow(jacobian_matrix, cmap='Greys', vmin=0, vmax=2, interpolation='none')
-        plt.title("Jacobian")
-        if ticks:
-            plt.xticks(ticks=range(len(self.unknowns)), 
-                       labels=[f'${self.system.latex(v)}$' for v in self.unknowns], rotation=90)
-            plt.yticks(ticks=range(len(self.equations)), 
-                       labels=[f'${label}$' for label in self.equations.keys()])
-        plt.gca().xaxis.set_ticks_position('top')
-        plt.gca().xaxis.set_label_position('top')
-        plt.show()
-
-        # print('shape:', jacobian_matrix.shape)
-        # print('rank:', np.linalg.matrix_rank(jacobian_matrix))
-
-        jacobian_matrix = jacobian_matrix.transpose()
-
-        import networkx as nx
-        import scipy.sparse as sp
-
-        # ----- (0) 係数行列 A を用意 ---------------------------------
-        A = sp.csr_matrix(jacobian_matrix, dtype=int)
-
-        m, n = A.shape
-        row_nodes = [f"r{i}" for i in range(m)]
-        col_nodes = [f"c{j}" for j in range(n)]
-
-        # ----- (1) 二部グラフ ----------------------------------------
-        G = nx.DiGraph()
-        G.add_nodes_from(row_nodes, bipartite=0)
-        G.add_nodes_from(col_nodes, bipartite=1)
-        for i, j in zip(*A.nonzero()):
-            G.add_edge(row_nodes[i], col_nodes[j])      # 式→変数
-
-        # 最大マッチング
-        matching = nx.algorithms.bipartite.maximum_matching(G, top_nodes=row_nodes)
-
-        # ----- (2) Dulmage–Mendelsohn グラフ --------------------------
-        DM = nx.DiGraph()
-        DM.add_nodes_from(G)
-        for u, v in G.edges():
-            if u in matching and matching[u] == v:
-                DM.add_edge(u, v); DM.add_edge(v, u)    # マッチング辺は両向き
-            else:
-                DM.add_edge(u, v)                       # 非マッチ辺は片向き
-
-        # ----- (3) 欠損/正則/過多ブロックの分類 -----------------------
-        unmatched_rows = {r for r in row_nodes if r not in matching}
-        unmatched_cols = {c for c in col_nodes if c not in matching.values()}
-
-        def reachable(starts, graph):
-            seen = set(starts); stack = list(starts)
-            while stack:
-                v = stack.pop()
-                for w in graph.successors(v):
-                    if w not in seen: seen.add(w); stack.append(w)
-            return seen
-
-        under = reachable(unmatched_rows, DM)                  # 欠損行側
-        over  = reachable(unmatched_cols, DM.reverse(copy=False))  # 欠損列側
-        regular = set(DM.nodes()) - under - over               # 中央正則部
-
-        # ----- (4) 正則部で SCC → トポロジカル並び --------------------
-        G_reg = DM.subgraph(regular).copy()
-        sccs  = list(nx.strongly_connected_components(G_reg))       # SCC 一覧
-        cond  = nx.condensation(G_reg)             # 縮約 DAG
-        solve_order = list(nx.topological_sort(cond))               # ブロック順
-
-        # ----- (5) 結果を表示 ----------------------------------------
-        print("=== Dulmage–Mendelsohn ブロック ===")
-        print(f"欠損行ブロック (rows under‑determined): {sorted(under)}")
-        print(f"欠損列ブロック (cols over‑determined) : {sorted(over)}")
-        print("\n=== 正則部の SCC ===")
-        for k, comp in enumerate(sccs):
-            print(f"  Block {k}: {sorted(comp)}")
-        print("\n解く順番 (トポロジカル順) :", solve_order)
-
-        # optional: ブロック三角化したパターンを確認
-        row_perm = [int(v[1:]) for comp_idx in solve_order
-                                for v in sccs[comp_idx] if v.startswith('r')]
-        col_perm = [int(v[1:]) for comp_idx in solve_order
-                                for v in sccs[comp_idx] if v.startswith('c')]
-        P = A[row_perm, :][:, col_perm]
-        print("\nBTF パターン:\n", P.toarray())
-
     def plot_dependencies(self, dependencies: list[Dependency]):
+        import networkx as nx
         G = nx.DiGraph()
         edge_colors = []
         edge_labels = {}
@@ -1121,4 +918,54 @@ class Solver:
         nx.draw(G, pos, edge_color=edge_colors, with_labels=True, node_size=2000, node_color='lightblue', font_size=10, font_color='black', arrows=True)
         nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8, label_pos=0.2)
         plt.title('Dependencies Graph')
+        plt.show()
+
+    def plot_stage(self, stage: Stage):
+        import networkx as nx
+        G = nx.DiGraph()
+        labels = {}
+        for block in stage.blocks:
+            labels[block.id] = \
+                f'#{block.id}\n'\
+                f'${", ".join(eq.label for eq in block.equations)}$\n'\
+                f'${", ".join(self.system.latex(v) for v in block.variables)}$'
+        orders = {}
+        xs = {}
+        for block in stage.blocks:
+            if block.depends_on:
+                order = max(orders[block.id] for block in block.depends_on) + 1
+            else:
+                order = 0
+            orders[block.id] = order
+            
+            x = 0
+            for id, b in orders.items():
+                if b == order:
+                    x += 1
+            xs[block.id] = x
+
+            # if set(block.knowns) & set(stage.inputs):
+            #     G.add_edge('Input', block.id)
+            for depends_on in block.depends_on:
+                G.add_edge(depends_on.id, block.id)
+
+        from networkx.algorithms.dag import topological_sort
+        import random
+        # order = list(topological_sort(G))
+        pos = {block.id: (xs[block.id] + random.uniform(-1, 1), -orders[block.id]) for block in stage.blocks}
+        # pos = nx.spring_layout(G)
+
+        plt.figure(figsize=(5, 5))
+        nx.draw(
+            G, pos,
+            with_labels=True,
+            labels=labels,
+            node_color='lightblue',
+            node_size=2000,
+            font_size=10,
+            arrows=True
+        )
+
+        plt.title("Block DAG")
+        plt.axis('off')
         plt.show()
