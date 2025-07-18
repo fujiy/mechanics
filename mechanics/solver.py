@@ -1,5 +1,6 @@
 import datetime
 import itertools
+import time
 from typing import cast, Any, Optional
 from collections import defaultdict
 import tempfile
@@ -176,8 +177,17 @@ class Block:
         assert self.dim == len(self.unknowns)
 
         self.explicit = None
-        if self.dim == 1:
-            self.explicit = {self.unknowns[0]: sp.solve(self.equations[0].lhs - self.equations[0].rhs, self.unknowns[0])[0]}
+        is_linear = True 
+        for eq in self.equations:
+            poly = (eq.lhs - eq.rhs).as_poly(*self.unknowns) # type:ignore
+            if poly is None or  poly.degree() > 1:
+                is_linear = False
+        if is_linear or self.dim == 1:
+            sol = sp.solve([eq.lhs - eq.rhs for eq in self.equations],  # type:ignore
+                           self.unknowns, dict=True)
+            if len(sol) == 1:
+                self.explicit = {v: sol[0][v] for v in self.unknowns}
+
 
         self.jacobian: defaultdict[Equation, dict[Function, Expr]] = defaultdict(dict)
         for eq in self.equations:
@@ -191,7 +201,7 @@ class Block:
 
         # print(self.jacobian)
 
-    def generate_code(self, printer: FortranPrinter) -> str:
+    def generate_code(self, printer: FortranPrinter, indices: tuple[Index, ...]) -> str:
         p = printer.doprint
         pn = printer.print_name
 
@@ -219,7 +229,7 @@ class Block:
 
             code += f'''
 
-            jac = 0
+            jac = 0.0d0
 
             do newton_iter = 1, 100
             '''
@@ -234,9 +244,11 @@ class Block:
                 if (ieee_is_nan(residual)) then
                     write(message, '("Block {self.id}, nan: ", i5, E10.4)') newton_iter, residual
                     status = 1
+                    call flush(6)
                     return
                 end if
                 if (residual < tol) exit
+
                 '''
             for i, eq in enumerate(self.equations):
                 for j, v in enumerate(self.unknowns):
@@ -249,10 +261,11 @@ class Block:
                 ! print *, "eq", eq
                 ! print *, "jac", jac
 
-                call dgesv({self.dim}, 1, jac, {self.dim}, ipiv, eq, {self.dim}, info)
+                call dgesv({self.dim}, 1, jac, size(jac, 1), ipiv, eq, {self.dim}, info)
                 if (info /= 0) then
                     write(message, '("Block {self.id}, dgesv error: ", i5)') info
                     status = 1
+                    call flush(6)
                     return
                 end if
                 '''
@@ -262,13 +275,14 @@ class Block:
             code += f'''
             end do
             if (residual >= tol) then
-                write(message, '("Block {self.id} not converging: ", i5, ", ", E10.4)') newton_iter, residual
+                write(message, '("Block {self.id} not converging: ", E10.4, {",".join([f'" {i.name} =", i5' for i in indices])})') residual, {', '.join([f"{p(i)}" for i in indices])}
                 status = 1
+                call flush(6)
                 return
             end if
             '''
 
-        return code
+        return code.replace("&\n", "&\n                ")
 
     def generate_args(self, printer: FortranPrinter) -> str:
         args = ', '.join([printer.print_name(v) for v in self.indices + self.variables + self.knowns])
@@ -492,7 +506,7 @@ class Solver:
 
         print(f'Indices: {self.indices}')
 
-        self.index_margin = 5
+        self.index_margin = 10
 
         self.tempdir = tempfile.mkdtemp()
 
@@ -553,7 +567,7 @@ class Solver:
             output: set[Function] = set()
             for dep in dependencies:
                 output.update([dep.var.subs_index(dep.index_mapping)])
-            print('output:', output)
+            # print('output:', output)
             
             input_in_output = True
             if index_combo:
@@ -602,13 +616,6 @@ class Solver:
             real(8), save :: {pn(c)} = 0.0d0'''
         code += f'''
         end module constants
-
-        module indices'''
-        for i in self.indices:
-            code += f'''
-            integer, save :: {pn(i)} = 0'''
-        code += f'''
-        end module indices
                                 
         subroutine run_solver(log_path, condition, status, message)
             use, intrinsic :: ieee_arithmetic
@@ -622,7 +629,7 @@ class Solver:
             integer, intent(out) :: status
             character(len=100), intent(out) :: message
 
-            integer :: log_unit
+            integer :: log_unit = 20
             integer :: ios
             
             real(8), dimension({dim_max}) :: eq
@@ -632,7 +639,7 @@ class Solver:
             integer :: info
             real(8) :: residual
             integer :: newton_iter
-            real(8) :: tol = 1e-8
+            real(8) :: tol = 1d-8
             integer :: i
 
             '''
@@ -660,7 +667,11 @@ class Solver:
         code += '\n'
 
         for n, c in enumerate(self.constants):
-            code += f'''
+            if c.space == Z:
+                code += f'''
+            {pn(c)} = int(condition({n + 1}))'''
+            else: 
+                code += f'''
             {pn(c)} = condition({n + 1})'''
         code += '\n'
 
@@ -687,8 +698,6 @@ class Solver:
                 
         code += f'''        
 
-            print *, "Running solver with condition: ", condition
-
             print *, "Started"
             print *, "Output in ", log_path
 
@@ -707,7 +716,7 @@ class Solver:
             '''
 
         for block in stages[0].blocks:
-            code += block.generate_code(printer)
+            code += block.generate_code(printer, self.indices)
 
         for i in self.indices:
             code += f'''
@@ -741,6 +750,7 @@ class Solver:
         code += f'''
 
             print *, "Completed"
+            call flush(6)
             close(log_unit)
         end subroutine run_solver
         '''
@@ -761,7 +771,7 @@ class Solver:
             newton_tol: float = 1e-8) -> Result:
 
         condition_ = { self.system(name): value for name, value in condition.items() }
-        print('Condition:', condition_)
+        # print('Condition:', condition_)
 
         lack_constants = [c for c in self.constants if c not in condition_]
         if lack_constants:
@@ -775,6 +785,7 @@ class Solver:
 
         status, message = self.module.run_solver(result.path, condition_values)
         if status != 0:
+            time.sleep(0.1)
             raise RuntimeError(message.decode('utf-8'))
 
         for c in self.constants:
@@ -907,12 +918,14 @@ class Solver:
             for depends_on in block.depends_on:
                 G.add_edge(depends_on.id, block.id)
         color_map = []
+        size_map = []
         for block_id in G.nodes:
             block = [block for block in stage.blocks if block.id == block_id][0]
             if block.explicit is None:
                 color_map.append('lightcoral')
             else:
                 color_map.append('lightblue')
+            size_map.append(len(block.equations) * 2500)
 
         from networkx.algorithms.dag import topological_sort
         import random
@@ -926,7 +939,7 @@ class Solver:
             with_labels=True,
             labels=labels,
             node_color=color_map,
-            node_size=2000,
+            node_size=size_map,
             font_size=10,
             arrows=True
         )
