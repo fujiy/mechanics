@@ -23,13 +23,13 @@ class BaseSpace(sp.Symbol):
         self.max = None
 
 class Index(sp.Symbol):
-    min: Optional[Expr]
-    max: Optional[Expr]
+    min: Expr
+    max: Expr
 
-    def __new__(cls, name: str, min: Optional[Expr] = None, max: Optional[Expr] = None):
+    def __new__(cls, name: str, min: Expr, max: Expr):
         return super().__new__(cls, name, integer=True)
     
-    def __init__(self, name: str, min: Optional[Expr] = None, max: Optional[Expr] = None):
+    def __init__(self, name: str, min: Expr, max: Expr):
         super().__init__()
         self.min = min
         self.max = max
@@ -100,6 +100,9 @@ class Function(spf.AppliedUndef):
         index_ = self.index
         index_[index] = index.assign(new_index)
         return self[*index_.values()]
+    
+    def subs_index(self, index_mapping: dict[Index, Expr]) -> 'Function':
+        return cast(Function, self.subs(index_mapping))
 
     def enumerate(self) -> list['Function']:
         if not self._index:

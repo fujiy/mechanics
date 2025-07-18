@@ -43,6 +43,9 @@ class DiscretizedSystem(System):
         self._discretized_spaces = { space_ : index_ }
         self._discretized_diffs[space_] = {}
 
+        if isinstance(step, str) and step not in self:
+            self.add_constant(step, space=space_)
+
         self.define(space_.name, self(step, manipulate=False, return_as_tuple=False) * index_, manipulate=False) #type: ignore
 
         return self

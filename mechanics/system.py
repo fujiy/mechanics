@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 
 from .util import *
 from .symbol import BaseSpace, Index, Expr, Basic, Function, Equation, Space
-from .space import R
+from .space import R, Z
 
 class System:
     _builtins:    dict[str, Any]
@@ -32,6 +32,7 @@ class System:
         
 
         self._dict = {}
+
         self._builtins = { k: getattr(sp, k) for k in dir(sp) if not k.startswith('_') }\
                        | { 'diff': self.diff, 'eval': self.eval, 'collect': self.collect,}
 
@@ -89,6 +90,12 @@ class System:
     
     def add_index(self, name: name_type, min: expr_type, max: expr_type) -> Self:
         symbols = make_symbol(name)
+
+        if isinstance(min, str) and min not in self:
+            self.add_constant(min, space=Z)
+        if isinstance(max, str) and max not in self:
+            self.add_constant(max, space=Z)
+
         indices = []
         for symbol in symbols: 
             index = Index(symbol.name, self(min, manipulate=False, return_as_tuple=False), self(max, manipulate=False, return_as_tuple=False))

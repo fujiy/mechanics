@@ -1,4 +1,5 @@
 import datetime
+import itertools
 from typing import cast, Any, Optional
 from collections import defaultdict
 import tempfile
@@ -23,7 +24,8 @@ import networkx as nx
 
 from mechanics.system import System
 from mechanics.symbol import Function, Expr, Index, Equation, Union
-from mechanics.util import python_name, name_type, tuple_ish, to_tuple
+from mechanics.util import python_name, name_type, tuple_ish, to_tuple, generate_prefixes
+from mechanics.space import Z
 
 class PythonPrinter(SciPyPrinter):
     # def _print_Symbol(self, expr):
@@ -40,16 +42,52 @@ class PythonPrinter(SciPyPrinter):
             return python_name(expr.name)
         
 class FortranPrinter(sympy.printing.fortran.FCodePrinter):
-    # def __init__(self, **settings) -> None:
-    #     super().__init__(**settings | {'source_format': 'free'})
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
 
-    def _print_Symbol(self, expr):
-        name = super()._print_Symbol(expr)
-        return '!!!!'
-        return python_name(name)
+        self.prefixes: dict[str, str] = {}
+
+        self.prefix_gen = generate_prefixes()
+
+    def get_prefix(self, name: str) -> str:
+        if name in self.prefixes:
+            return self.prefixes[name]
+        else:
+            prefix = next(self.prefix_gen)
+            self.prefixes[name] = prefix
+            return prefix
+
+    def _print_Symbol(self, symbol):
+        if isinstance(symbol, Index):
+            return f'{self.get_prefix(symbol.name)}_{python_name(symbol.name)}'
+        else:
+            str(symbol)
     
-    def _print_Function(self, expr):
-        return str(expr)
+    def _print_Function(self, f):
+        if isinstance(f, Function):
+            if f.index:
+                indices  = [self.doprint(value - i.min + 1) for i, value in f.index.items()]
+                return f'{self.get_prefix(f.name)}_{python_name(f.name)}({", ".join(indices)})' 
+            else:
+                return f'{self.get_prefix(f.name)}_{python_name(f.name)}'
+        else:
+            return super()._print_Function(f)
+        
+    def print_name(self, f: Union[Index, Function]) -> str:
+        return f'{self.get_prefix(f.name)}_{python_name(f.name)}'
+    
+    def print_as_array_arg(self, f: Function) -> str:
+        if not f.index:
+            return f'{self.print_name(f)}'
+        return f'{self.print_name(f)}({",".join([":"] * len(f.index))})'
+    
+    # def print_dimension(self, f: Function) -> str:
+    #     if not f.index:
+    #         return ''
+    #     dimension = 'dimension('
+    #     dimension += ', '.join(f'{index.min}:{index.max}' for index in f.index)
+    #     dimension += '),'
+    #     return dimension
     
         
 class Result:
@@ -71,11 +109,20 @@ class Result:
             
         os.makedirs(self.path, exist_ok=True)
 
-    def set_data(self, keys, values, N=None):
-        if N:
-            self._dict.update({python_name(key.name): value[:N] for key, value in zip(keys, values)})
+    def set_data(self, key: Any, value: Any):
+        if isinstance(key, str):
+            name = python_name(key)
+        elif hasattr(key, 'name'):
+            name = python_name(key.name)
         else:
-            self._dict.update({python_name(key.name): value for key, value in zip(keys, values)})
+            raise TypeError(f'Expected str or Symbol, got {type(key)}: {key}')
+        if name in self._dict:
+            raise ValueError(f'Key {name} already exists in the result. ')
+        self._dict[name] = value
+
+    def set_data_dict(self, key_values: dict[Any, Any]):
+        for key, value in key_values.items():
+            self.set_data(key, value)
 
     # Access
     
@@ -100,10 +147,10 @@ class Result:
 
 class Dependency:
 
-    def __init__(self, eq: Equation, var: Function, index_map: dict[Index, Expr]):
+    def __init__(self, eq: Equation, var: Function, index_mapping: dict[Index, Expr]):
         self.eq = eq
         self.var = var
-        self.index_mapping = index_map
+        self.index_mapping = index_mapping # index of eq <-> index of var
         self.matching = False
 
     def __repr__(self) -> str:
@@ -112,12 +159,16 @@ class Dependency:
 class Block:
     def __init__(self, id: int, 
                  equations: list[Equation],
+                 variables: list[Function],
                  unknowns: list[Function], 
-                 knowns: list[Function]):
+                 knowns: list[Function],
+                 indices: list[Index]):
         self.id = id
-        self.equations = tuple(equations)
-        self.unknowns = tuple(unknowns)
-        self.knowns = tuple(knowns)
+        self.equations = equations
+        self.variables = variables
+        self.unknowns = unknowns
+        self.knowns = knowns
+        self.indices = indices
 
         self.dim = len(self.equations)
 
@@ -133,16 +184,31 @@ class Block:
 
         print(self.jacobian)
 
+    def generate_fortran_args(self, printer: FortranPrinter) -> str:
+        args = ', '.join([printer.print_name(v) for v in self.indices + self.variables + self.knowns])
+        return args
+
     def generate_fortran(self, printer: FortranPrinter) -> str:
-        args = ', '.join([ v.name for v in self.unknowns + self.knowns ])
+        args = self.generate_fortran_args(printer)
         code = f'''
         subroutine block_{self.id}_equation({args}, eq)
             use constants
             implicit none
-            real(8), dimension({self.dim}), intent(out) :: eq'''
-        for v in self.unknowns + self.knowns:
+            real(8), intent(out) :: eq(:)'''
+        for i in self.indices:
             code += f'''
-            real(8), intent(in) :: {v.name}'''
+            integer, intent(in) :: {printer.print_name(i)}'''
+        for v in self.variables + self.knowns:
+            code += f'''
+            real(8), intent(in) :: {printer.print_as_array_arg(v)}'''
+
+        # for v in self.variables + self.knowns:
+        #     code += f'''
+        #     print *, "range: {printer.print_name(v)}, ", lbound({printer.print_name(v)}), ubound({printer.print_name(v)})'''
+        # for v in self.unknowns:
+        #     code += f'''
+        #     print *, "output: {printer.doprint(v)}, ", {printer.doprint(v)}, F_i'''
+
         for i, eq in enumerate(self.equations):
             code += f'''
             eq({i+1}) = {printer.doprint(eq.lhs - eq.rhs)} ! {eq.label}'''
@@ -152,15 +218,18 @@ class Block:
         subroutine block_{self.id}_jacobian({args}, jac)
             use constants
             implicit none
-            real(8), dimension({self.dim}, {self.dim}), intent(out) :: jac'''
+            real(8), intent(out) :: jac(:,:)'''
+        for i in self.indices:
+            code += f'''
+            integer, intent(in) :: {printer.print_name(i)}'''
         for v in self.unknowns + self.knowns:
             code += f'''
-            real(8), intent(in) :: {v.name}'''
+            real(8), intent(in) :: {printer.print_as_array_arg(v)}'''
         for i, eq in enumerate(self.equations):
             for j, v in enumerate(self.unknowns):
                 if v in self.jacobian[eq]:
                     code += f'''
-            jac({i+1}, {j+1}) = {printer.doprint(self.jacobian[eq][v])} ! d({eq.label})/d({v.name})'''
+            jac({i+1}, {j+1}) = {printer.doprint(self.jacobian[eq][v])}'''
 
         code += f'''
         end subroutine block_{self.id}_jacobian
@@ -168,7 +237,7 @@ class Block:
         return textwrap.dedent(code)
 
     def __repr__(self) -> str:
-        return f'Block #{self.id}(equations={tuple(eq.label for eq in self.equations)}, unknowns={self.unknowns}), knowns={self.knowns})'
+        return f'Block #{self.id}(equations={tuple(eq.label for eq in self.equations)}, variables={self.variables}, unknowns={self.unknowns}), knowns={self.knowns}, indices={self.indices})'
 
 Node = Union[Equation, Function]
 def show_node(node: Node) -> str:
@@ -182,14 +251,13 @@ class Solver:
 
     variables: tuple[Function, ...]
 
-    def maximum_matching(self) -> tuple[list[Dependency], 
-                                        dict[Equation, list[Dependency]],
-                                          dict[Function, list[Dependency]]]:
+    def maximum_matching(self, dependencies: list[Dependency]) \
+        -> tuple[list[Dependency], dict[Equation, list[Dependency]], dict[Function, list[Dependency]]]:
 
         equations: defaultdict[Equation, list[Dependency]] = defaultdict(list)
         unknowns: defaultdict[Function, list[Dependency]] = defaultdict(list)
 
-        for dependency in self.dependencies:
+        for dependency in dependencies:
             equations[dependency.eq].append(dependency)
             unknowns[dependency.var].append(dependency)
 
@@ -237,12 +305,14 @@ class Solver:
                         p.matching = not p.matching
                     break
             # print(eq.label)
-            # self.plot_dependencies()
+            # self.plot_dependencies(dependencies)
+
+        # self.plot_dependencies()
 
         matched: list[Dependency] = []
         matched_eqs: set[Equation] = set()
         matched_unks: set[Function] = set()
-        for dep in self.dependencies:
+        for dep in dependencies:
             if dep.matching:
                 matched.append(dep)
                 assert dep.eq not in matched_eqs
@@ -254,24 +324,30 @@ class Solver:
 
         return matched, equations, unknowns
 
-    def block_decomposition(self) -> list[Block]:
+    def block_decomposition(self, dependencies: list[Dependency], inputs: set[Function]) -> list[Block]:
         
         edges: dict[Node, list[Node]] = defaultdict(list)
         inverse_edges: dict[Node, list[Node]] = defaultdict(list)
-        for dep in self.dependencies:
+
+        output_indexed: dict[Function, Function] = {}
+
+        for dep in dependencies:
             edges[dep.eq].append(dep.var)
             inverse_edges[dep.var].append(dep.eq)
             if dep.matching:
                 edges[dep.var].append(dep.eq)
                 inverse_edges[dep.eq].append(dep.var)
+            output_indexed[dep.var] = dep.var.subs_index(dep.index_mapping)
+
 
         visited: dict[Node, int] = {}
         order = 1
 
-        print('Edges:', [(f'{show_node(k)} -> {", ".join(show_node(n) for n in v)}') for k, v in edges.items()])
+        # print('Edges:', [(f'{show_node(k)} -> {", ".join(show_node(n) for n in v)}') for k, v in edges.items()])
         # print('Inverse edges:', inverse_edges)
 
         def first_dfs(node: Node):
+
             nonlocal order
             if node in visited:
                 if visited[node] == 0:
@@ -294,7 +370,6 @@ class Solver:
                 order += 1
                     
         for node in edges.keys():
-            # print(f'first_dfs: {show_node(node)}')
             first_dfs(node)
 
         visited_ordered = list(visited.items())
@@ -318,7 +393,7 @@ class Solver:
             return nodes
         
 
-        nodess = []
+        nodess: list[set[Node]] = []
         for node, i in visited_ordered:
             nodess.append(second_dfs(node))
 
@@ -326,17 +401,22 @@ class Solver:
         block_id = 0
         for nodes in reversed(nodess):
             if nodes:
-                equations = []
-                unknowns = []
-                knowns = set()
+                equations: list[Equation] = []
+                variables: list[Function] = []
+                knowns: set[Function] = inputs.copy()
                 for node in nodes:
                     if node in self.equations:
-                        equations.append(node)
-                        knowns |= set(edges.get(node, []))
+                        equations.append(cast(Equation, node))
+                        knowns |= set(cast(list[Function], edges.get(node, [])))
                     else:
-                        assert node in self.unknowns
-                        unknowns.append(node)
-                block = Block(block_id, equations, unknowns, list(knowns - set(unknowns)))
+                        # assert node in self.unknowns
+                        variables.append(cast(Function, node))
+                block = Block(block_id, 
+                              equations, 
+                              variables,
+                              [output_indexed[v] for v in variables],
+                              list(knowns - set(variables)), 
+                              list(self.indices))
                 blocks.append(block)
                 block_id += 1
             # print('visited_second', visited_second)
@@ -354,56 +434,139 @@ class Solver:
 
         print(f'Indices: {self.indices}')
 
+        self.index_margin = 5
+
         self.tempdir = tempfile.mkdtemp()
 
+        self.input: tuple[Function, ...] = ()
         if input is None:
-            self.input = tuple(cast(Function, v) for v in system.state_space())
+            if self.system.indices:
+                i = self.system.indices[0]
+                self.input = tuple(cast(Function, v.subs(i, i.min)) for v in self.system.state_space())
+            else:
+                self.input = ()
         else:
             self.input = to_tuple(input)
 
+        print(f'Input: {self.input}')
+
+        constants = set(self.constants)
+
         self.equations: set[Equation] = set()
-        self.unknowns: set[Function] = set()
-        self.dependencies: list[Dependency] = []
+        # self.unknowns: set[Function] = set()
 
         for eq in system.equations.values():
             equation = self.system.eval(eq)
             self.equations.update([cast(Equation, equation)]) 
-            unknowns = self.system.dependencies_of(equation) #type:ignore
-            self.unknowns.update(unknowns)
-            for v in unknowns:
-                self.dependencies.append(Dependency(eq, v.general_form(), v.index_mapping()))
+            # self.unknowns.update(unknowns)
 
-        max_matching, eq_deps, unk_deps = self.maximum_matching()
-        print('match', max_matching)
+        # for dep in self.dependencies:
+            # print(dep)
 
-        blocks = self.block_decomposition()
-        for block in blocks:
-            print(block)
+        index_combinations = tuple(dict(combo) for combo in 
+                                   itertools.product(*[[(i, i.min), (i, i), (i, i.max)] 
+                                   for i in self.indices]))
+        print('Index combinations:', index_combinations)
+        class Stage:
+            def __init__(self, indices: dict[Index, Expr], inputs: list[Function], blocks: list[Block]):
+                self.indices = indices
+                self.inputs = inputs
+                self.blocks = blocks
+
+            def __repr__(self) -> str:
+                s = f'Stage(indices={self.indices}, inputs={self.inputs})):\n'
+                for block in self.blocks:
+                    s += f'  {block}\n'
+                return s
+
+        stages: list[Stage] = []
+
+        for index_combo in index_combinations:
+            inputs = set()
+            for v in self.input:
+                if all(index_combo.get(i, None) == mapped 
+                       for i, mapped in v.index_mapping().items()):
+                    inputs.update([v.general_form()])
+                    
+            print(f'Input on this combo: {index_combo}, {inputs}')
+
+            dependencies: list[Dependency] = []
+            for eq in self.equations:
+                unknowns = self.system.dependencies_of(eq) - constants - inputs  #type:ignore
+                for v in unknowns:
+                    dependencies.append(Dependency(eq, v.general_form(), v.index_mapping()))
+                
+            # for dep in dependencies:
+            #     print(dep)
+
+            max_matching, eq_deps, unk_deps = self.maximum_matching(dependencies)
+            # print('match', max_matching)
+            self.plot_dependencies(dependencies)
+
+            output: set[Function] = set()
+            for dep in dependencies:
+                output.update([dep.var.subs_index(dep.index_mapping)])
+            print('output:', output)
+            
+            input_in_output = True
+            if index_combo:
+                i = list(index_combo.keys())[0]
+                for v_in in inputs:
+                    if v_in.at(i, i+1) not in output:
+                        input_in_output = False
+                        break
+            print(input_in_output)
+
+            blocks = self.block_decomposition(dependencies, inputs)
+            # for block in blocks:
+            #     print(block)
+
+            stage = Stage(index_combo, list(inputs), blocks)
+            
+            stages.append(stage)
+            print(stage)
+
+            if input_in_output:
+                break
+
+        # print('Stages:')
+        # for stage in stages:
+        #     print(stage)
 
         printer = FortranPrinter({'source_format': 'free', 'strict': False, 'standard': 95, 'precision': 15})
+        p = printer.doprint
+        pn = printer.print_name
         
-        dim_max = max([block.dim for block in blocks])
-
-        condition_dim = len(self.constants)
+        dim_max = max([block.dim for stage in stages for block in stage.blocks ])
+        condition_dim = len(self.constants) + len(self.input)
     
         code = ''
         code += f'''
         module constants
-            real(8), parameter :: pi = 3.14159265358979323846
+            real(8), save :: pi = 3.14159265358979323846
+        '''
+        for c in self.constants:
+            if c.space == Z:
+                code += f'''
+            integer, save :: {pn(c)} = 0'''
+            else: 
+                code += f'''
+            real(8), save :: {pn(c)} = 0.0'''
+        code += f'''
         end module constants
 
-        module variables'''
-        for v in self.indices + self.variables:
+        module indices'''
+        for i in self.indices:
             code += f'''
-            real(8), save :: {v.name} = 0.0'''
+            integer, save :: {pn(i)} = 0'''
         code += f'''
-        end module variables
+        end module indices
 
         module blocks
         contains
         '''
 
-        for block in blocks:
+        for block in stages[0].blocks:
             code += textwrap.indent(block.generate_fortran(printer), ' '*12)
 
         code += f'''
@@ -412,7 +575,6 @@ class Solver:
         subroutine run_solver(log_path, condition, status, message)
             use, intrinsic :: ieee_arithmetic
             use constants
-            use variables
             use blocks
             implicit none
             double precision dnrm2
@@ -435,7 +597,56 @@ class Solver:
             integer :: newton_iter
             real(8) :: tol = 1e-8
             integer :: i
-                                
+
+            '''
+        
+        for i in self.indices:
+            code += f'''
+            integer :: {pn(i)} = 0'''
+
+        for v in self.variables:
+            if v.index:
+                code += f'''
+            real(8), allocatable :: {printer.print_as_array_arg(v)}'''
+            else:
+                code += f'''
+            real(8) :: {pn(v)} = 0.0'''
+        code += '\n'
+
+        for f in self.system.definitions.keys():
+            if f.index:
+                code += f'''
+            real(8), allocatable :: {printer.print_as_array_arg(f)}'''
+            else:
+                code += f'''
+            real(8) :: {pn(f)} = 0.0'''
+        code += '\n'
+
+        for n, c in enumerate(self.constants):
+            code += f'''
+            {pn(c)} = condition({n + 1})'''
+        code += '\n'
+
+        for v in self.variables:
+            if v.index:
+                code += f'''
+            allocate({pn(v)}({",".join(f"{p(i.max - i.min + self.index_margin)}" for i in v.index)}))'''
+        code += '\n'
+
+        for f in self.system.definitions.keys():
+            if f.index:
+                code += f'''
+            allocate({pn(f)}({",".join(f"{p(i.max - i.min + 1)}" for i in f.index)}))'''
+        code += '\n'
+
+        for i, v in enumerate(self.input):
+            code += f'''
+            {p(v)} = condition({len(self.constants) + i + 1})'''
+                
+        code += f'''        
+
+            print *, "Running solver with condition: ", condition
+
             print *, "Started"
             print *, "Output in ", log_path
 
@@ -445,27 +656,63 @@ class Solver:
                print *, "Error opening file: ", log_path//"log.bin"
                stop 1
             end if
+
         '''
-        for block in blocks:
-            args = ', '.join([v.name for v in block.unknowns + block.knowns])
+        for i in self.indices:
             code += f'''
-            ! --- Block {block.id} ---
+            do {pn(i)} = {p(i.min)}, {p(i.max)}
+                ! print *, "{pn(i)} =", {pn(i)}
+            '''
+
+        for block in stages[0].blocks:
+            args = block.generate_fortran_args(printer)
+            code += f'''
+            ! ======================== Block {block.id} ========================
+            '''
+            for i, v in enumerate(block.unknowns):
+                if v.index:
+                    cond = ' .and. '.join(f'{p(i.min)} .lt. {p(value)}' for i, value in v.index.items())
+                    previous = [(i, value - 1) for i, value in v.index.items()] # type:ignore
+                    print(block.id, v, previous)
+                    code += f'''
+            if ({cond}) then
+                {printer.doprint(v)} = {printer.doprint(v.general_form().subs(previous))}
+            end if'''
+
+            code += f'''
 
             call block_{block.id}_equation({args}, eq)
 
-            do newton_iter = 1, 100
+            do newton_iter = 1, 10
                 jac = 0
 
                 call block_{block.id}_jacobian({args}, jac)
 
+                ! print *, "Block {block.id}"
+                ! print *, "eq", eq
+                ! print *, "jac", jac
+
                 ! jac * r = eq; eq = r
                 call dgesv({block.dim}, 1, jac, {block.dim}, ipiv, eq, {block.dim}, info)
+                if (info /= 0) then
+                    write(message, '("Block {block.id}, dgesv error: ", i5)') info
+                    status = 1
+                    return
+                end if
                 '''
             for i, v in enumerate(block.unknowns):
                 code += f'''
-                {v.name} = {v.name} - eq({i+1})'''
+                ! print *, "old ", "{pn(v)}", {pn(v)} 
+                {printer.doprint(v)} = {printer.doprint(v)} - eq({i+1})
+                ! print *, "new ", "{pn(v)}", {pn(v)} 
+                '''
             code += f'''
+
+                ! print *, "red", eq
+
                 call block_{block.id}_equation({args}, eq)
+
+                ! print *, "new_eq", eq
 
                 residual = dnrm2({block.dim}, eq, 1)
 
@@ -481,13 +728,38 @@ class Solver:
                 status = 1
                 return
             else
-                print "('  Block {block.id} converged in ', i3, ' iterations, residual = ', E10.4)", newton_iter, residual
+                ! print "('  Block {block.id} converged in ', i3, ' iterations, residual = ', E10.4)", newton_iter, residual
             end if
             '''
 
-        for v in self.variables:
+        for i in self.indices:
             code += f'''
-            write (log_unit) {v.name}'''
+            end do ! {pn(i)}
+            '''
+
+        for v in self.variables:
+            if v.index:
+                code += f'''
+            write (log_unit) {pn(v)}({", ".join(f"{1}:{p(i.max - i.min + 1)}" for i in v.index)})'''
+            else:
+                code += f'''
+            write (log_unit) {pn(v)}'''
+                
+        code += f'''
+            print *, "Calculating definitions"
+        '''
+
+        for f, definition in self.system.definitions.items():
+            for i in self.indices:
+                code += f'''
+            do {pn(i)} = {p(i.min)}, {p(i.max)}'''
+                code += f'''
+                {p(f)} = {p(definition)}'''
+                code += f'''
+            end do ! {pn(i)}'''
+            code += f'''
+            write (log_unit) {pn(f)} ! {f.name}
+            '''
             
         code += f'''
 
@@ -496,9 +768,8 @@ class Solver:
         end subroutine run_solver
         '''
         code = textwrap.dedent(code)
-        print(code)
-
-        print(self.tempdir)
+        # print('\n'.join( [ f"{n:04} {line}" for n, line in enumerate(code.splitlines())]))
+        # print(self.tempdir)
 
         self.module = self.compile_and_load(code, [])
 
@@ -513,12 +784,15 @@ class Solver:
             newton_tol: float = 1e-8) -> Result:
 
         condition_ = { self.system(name): value for name, value in condition.items() }
+        print('Condition:', condition_)
 
         lack_constants = [c for c in self.constants if c not in condition_]
         if lack_constants:
             raise ValueError(f'Value of {lack_constants} must be provided in condition')
 
-        condition_values = np.array([ condition_[c] for c in self.constants ] + [0])
+        condition_values = np.array(
+            [ condition_[c] for c in self.constants ] 
+            + [  condition_[v] for v in self.input ])
 
         result = Result(self.system, directory=directory, name=name)
 
@@ -526,11 +800,31 @@ class Solver:
         if status != 0:
             raise RuntimeError(message.decode('utf-8'))
 
-        result.set_data(self.constants, condition_values)
+        for c in self.constants:
+            result.set_data(c, condition_[c])
         
         with open(os.path.join(result.path, 'log.bin'), 'rb') as f:
             log_data = np.fromfile(f, dtype=np.float64)
-            result.set_data(self.variables, log_data)
+            # print('Log data:', log_data)
+
+            ranges = { i: (sp.sympify(i.min).subs(condition_), sp.sympify(i.max).subs(condition_)) for i in self.indices }
+            sizes = { i: r[1] - r[0] + 1 for i, r in ranges.items() }
+
+            for i in self.indices:
+                result.set_data(i, range(ranges[i][0], ranges[i][1] + 1))
+
+            offset = 0
+            for v in self.variables + tuple(self.system.definitions.keys()):
+                if v.index:
+                    size = np.prod([sizes[i] for i in v.index])
+                    values = log_data[offset:offset + size].reshape(*[sizes[i] for i in v.index])
+                    offset += size
+                    result.set_data(v, values)
+                else:
+                    result.set_data(v, log_data[offset])
+                    offset += 1
+
+            # result.set_data(self.variables, log_data)
         
 
         return result
@@ -659,8 +953,11 @@ class Solver:
     
     def compile_and_load(self, source: str, libs: list[str] = []) -> Any:
 
-        with open(os.path.join(self.tempdir, 'generated.f90'), 'w') as f:
+        generate_path = os.path.join(self.tempdir, 'generated.f90')
+
+        with open(generate_path, 'w') as f:
             f.write(source)
+        print(generate_path)
 
         lib_files = [str(importlib.resources.files('mechanics').joinpath(f'fortran/{filename}'))
             for filename in libs]
@@ -801,19 +1098,27 @@ class Solver:
         P = A[row_perm, :][:, col_perm]
         print("\nBTF パターン:\n", P.toarray())
 
-    def plot_dependencies(self):
+    def plot_dependencies(self, dependencies: list[Dependency]):
         G = nx.DiGraph()
         edge_colors = []
-        for dep in self.dependencies:
-            G.add_edge(dep.eq.label, dep.var.name)
+        edge_labels = {}
+        for dep in dependencies:
+            u = '$' + dep.eq.label + '$'
+            v = '$' + self.system.latex(dep.var) + '$'
+            G.add_edge(u, v)
             if dep.matching:
                 edge_colors.append('red')
             else:
                 edge_colors.append('black')
-        left_nodes = {eq.label for eq in self.equations}
+            if (u, v) in edge_labels:
+                edge_labels[(u, v)] += f', {dep.index_mapping}'
+            else:
+                edge_labels[(u, v)] = str(dep.index_mapping)
+        left_nodes = {'$' + eq.label + '$' for eq in self.equations}
         pos = nx.bipartite_layout(G, left_nodes)
 
         plt.figure(figsize=(5, 5))
         nx.draw(G, pos, edge_color=edge_colors, with_labels=True, node_size=2000, node_color='lightblue', font_size=10, font_color='black', arrows=True)
+        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8, label_pos=0.2)
         plt.title('Dependencies Graph')
         plt.show()
