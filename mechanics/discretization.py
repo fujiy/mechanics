@@ -97,21 +97,15 @@ class DiscretizedSystem(System):
         for discretizer, options in self._discretizers:
             discretizer.setup(self._original, self, **options)
 
+        for eq in self._original._equations.values():
+            self.equate(self.discretize_expr(cast(sp.Expr, eq.lhs)), 
+                        self.discretize_expr(cast(sp.Expr, eq.rhs)), 
+                        label=eq.label,
+                        manipulate=False)
+        
         for discretizer, options in self._discretizers:
             discretizer.apply_to_equations(tuple(self._original._equations.values()))
-        if not self._discretizers:
-            for eq in self._original._equations.values():
-                self.equate(self.discretize_expr(cast(sp.Expr, eq.lhs)), 
-                            self.discretize_expr(cast(sp.Expr, eq.rhs)), 
-                            label=eq.label,
-                            manipulate=False)
-            
-            # if applied: break
-            # if not applied:
-            #     self.equate(self.discretize_single_expr(cast(sp.Expr, eq.lhs)), 
-            #                 self.discretize_expr(cast(sp.Expr, eq.rhs)), 
-            #                 label=eq.label)
-        
+                    
         return self
 
     def primary_index(self) -> Optional[Index]:

@@ -562,7 +562,7 @@ class System:
                 self.show(sp.Eq(f, definition))
 
         if self.equations:
-            self.show(label_str='Equations')
+            self.show(label_str='Equations:')
             for label, eq in self.equations.items():
                 self.show(eq, label=label)
 

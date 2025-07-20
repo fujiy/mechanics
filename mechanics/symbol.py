@@ -25,6 +25,7 @@ class BaseSpace(sp.Symbol):
 class Index(sp.Symbol):
     min: Expr
     max: Expr
+    ghosts: list[int]
 
     def __new__(cls, name: str, min: Expr, max: Expr):
         return super().__new__(cls, name, integer=True)
@@ -33,6 +34,7 @@ class Index(sp.Symbol):
         super().__init__()
         self.min = min
         self.max = max
+        self.ghosts = []
 
     def assign(self, value: Expr) -> Expr:
         return value
@@ -41,6 +43,12 @@ class Index(sp.Symbol):
         if self.min is None or self.max is None:
             raise ValueError(f'Index {self} has no min or max value')
         return [self.assign(cast(Expr, i)) for i in range(int(self.min), int(self.max) + 1)]
+
+    def extend_ghost(self, ghost: int) -> 'Index':
+        if ghost not in self.ghosts:
+            self.ghosts.append(ghost)
+        return self
+        
 
 class Function(spf.AppliedUndef):
     name: str
@@ -120,6 +128,27 @@ class Function(spf.AppliedUndef):
     
     def index_mapping(self) -> dict[Index, Expr]:
         return { i: self.index[i] for i in self._index if i != self.index[i] }
+    
+    def index_matches(self, pattern: 'Function', for_all: list[Index] = []) -> Optional[dict[Index, Expr]]:
+        assert self.name == pattern.name, f'Function names do not match: {self.name} != {pattern.name}'
+        match = {}
+        for i, j in zip(self.index.values(), pattern.index.values()):
+            if any(i.coeff(k) not in [0, 1] for k in for_all):
+                raise ValueError(f'Index {i} must be simple')
+            if any(j.coeff(k) not in [0, 1] for k in for_all):
+                raise ValueError(f'Index {j} must be simple')
+            minimums = [(k, k.min) for k in for_all]
+            maximums = [(k, k.max) for k in for_all]
+            min_condition = i.subs(minimums) - j.subs(minimums) >= 0
+            max_condition = j.subs(maximums) - i.subs(maximums) >= 0
+            if min_condition == True and max_condition == True:
+                match[i] = j
+            elif min_condition == False or max_condition == False:
+                return None
+            else:
+                raise ValueError(f'Cannot determine index match for {i} and {j} with conditions {min_condition} and {max_condition}')
+        return {}
+
     
     # Get Info
 

@@ -2,7 +2,7 @@ from typing import Optional, Union, cast, Callable, Any
 import sympy as sp
 import sympy.core.function as spf
 from mechanics.util import name_type, expr_type, tuple_ish, to_tuple
-from mechanics.symbol import Index, Function, Equation, BaseSpace
+from mechanics.symbol import Index, Function, Equation, BaseSpace, Expr
 from mechanics.system import System
 from mechanics.discretization import DiscretizedSystem, Discretizer
 
@@ -49,33 +49,48 @@ class Integrator(Discretizer):
                         for x in self.dX_original)
         
     def apply_to_equations(self, equations: tuple[Equation, ...]):
-        nX = set(self.X) - set(self.dX) # non-derivative variables
-        hX = set(self.dX) - set(self.X) # highest order derivatives 
 
-        def replace_equation(X: tuple[sp.Expr, ...], dX: tuple[sp.Expr, ...], label: str):
+        # nX = set(self.X) - set(self.dX) # non-derivative variables
+        # hX = set(self.dX) - set(self.X) # highest order derivatives 
 
-            # print(f'replace_equation: {X}, {dX}, {label}')
+        def replace_equation(X: tuple[sp.Expr, ...], dX: tuple[sp.Expr, ...], label: str, base_index: Optional[Expr] = None):
+            if base_index:
+                base = {self.index: base_index}
+            else:
+                base = {}
+
+            # print(f'replace_equation: {X}, {dX}, {label}, {self.dX}')
 
             for x, x_new in zip(self.X, X):
+                # print(f'Updating {x} -> {x_new}')
                 if x in self.dX:
                     n = self.dX.index(x)
                     dx_new = dX[n]
+                    # print(f'Updating {x} -> {x_new}, {dx_new}')
                     if x_new != dx_new:
                         if hasattr(dx_new, 'name'):
                             name = dx_new.name #type:ignore
                         else:
                             name = str(dx_new)
-                        self.system.equate(x_new, dx_new, label=f'State_{{{name}}}', manipulate=False)
+                        self.system.equate(x_new.subs(base), dx_new.subs(base), label=f'State_{{{name}}}', manipulate=False)
+
 
             subs = {}
             for x, x_new, dx, dx_new in zip(self.X, X, self.dX, dX):
                 # if dx in hX:
-                    subs[x] = x_new
-                    subs[dx] = dx_new
+                subs[x] = x_new
+                subs[dx] = dx_new
+
+                # if hasattr(dx_new, 'name'):
+                #     name = dx_new.name #type:ignore
+                # else:
+                #     name = str(dx_new)
+                # self.system.equate(dx.subs(base), dx_new.subs(base), label=f'State_{{{name}}}', manipulate=False)
+                # print(f'subs: {x} -> {x_new}, {dx} -> {dx_new}')
 
             for eq in equations:
-                lhs_applied = self.system.discretize_expr(eq.lhs).subs(subs)
-                rhs_applied = self.system.discretize_expr(eq.rhs).subs(subs)
+                lhs_applied = self.system.discretize_expr(eq.lhs).subs(subs).subs(base)
+                rhs_applied = self.system.discretize_expr(eq.rhs).subs(subs).subs(base)
         
                 self.system.equate(lhs_applied, rhs_applied, label=f'{{{eq.label}}}_{{{label}}}', manipulate=False)
 
@@ -111,6 +126,8 @@ class Euler(Integrator):
 
         replace_equation(self.X, tuple(K), 'K')
 
+        self.index.extend_ghost(1)  # Extend index to include the next step
+
         for x, k in zip(self.X, K):
             self.system.equate(x.at(self.index, self.index + 1), x + step * k, 
                                label=f'{{{self.name}}}_{{{x.name}}}', 
@@ -122,7 +139,7 @@ class BackwardEuler(Integrator):
 
     def __init__(self, step):
         self.step = step
-        self.name = 'BackwardEuler'
+        self.name = 'BEuler'
 
     def step_equations(self, replace_equation: Callable[[tuple[sp.Expr, ...], tuple[sp.Expr, ...], str], None]):
         step = cast(sp.Expr, self.system(self.step))
@@ -133,7 +150,9 @@ class BackwardEuler(Integrator):
             self.system.add_variable(k_name, index=tuple(dx.index.keys()))
             K.append(self.system[k_name])
 
-        replace_equation(self.X, tuple(K), 'K')
+        replace_equation(self.X, tuple(K), 'K', self.index + 1)
+
+        self.index.extend_ghost(1)
 
         for x, k in zip(self.X, K):
             self.system.equate(x.at(self.index, self.index + 1), x + step * k.at(self.index, self.index + 1), 
@@ -163,6 +182,8 @@ class RK2(Integrator):
 
         replace_equation(self.X, tuple(K1), 'K1')
         replace_equation(tuple(x + step * k for x, k in zip(self.X, K1)), tuple(K2), 'K2')
+
+        self.index.extend_ghost(1)
 
         for x, k1, k2 in zip(self.X, K1, K2):
             self.system.equate(x[self.index + 1], x + step / 2 * (k1 + k2), 
@@ -205,6 +226,8 @@ class RK4(Integrator):
         replace_equation(tuple(x + step / 2 * k for x, k in zip(self.X, K1)), tuple(K2), 'K2')
         replace_equation(tuple(x + step / 2 * k for x, k in zip(self.X, K2)), tuple(K3), 'K3')
         replace_equation(tuple(x + step * k for x, k in zip(self.X, K3)), tuple(K4), 'K4')
+
+        self.index.extend_ghost(1)
 
         for x, k1, k2, k3, k4 in zip(self.X, K1, K2, K3, K4):
             self.system.equate(x[self.index + 1], x + step / 6 * (k1 + 2*k2 + 2*k3 + k4), 

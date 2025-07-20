@@ -147,20 +147,21 @@ class Result:
 
 class Dependency:
 
-    def __init__(self, eq: Equation, var: Function, index_mapping: dict[Index, Expr]):
-        self.eq = eq
+    def __init__(self, var: Function, eq: Equation):
         self.var = var
-        self.index_mapping = index_mapping # index of eq <-> index of var
+        self.eq = eq
         self.matching = False
 
     def __repr__(self) -> str:
-        return f'{self.eq.label} <- {self.var.name}, {self.index_mapping}'
+        if self.matching:
+            return f'{self.var} <-> {self.eq.label}'
+        else:
+            return f'{self.var} --> {self.eq.label}'
     
 class Block:
     def __init__(self, id: int, 
                  equations: list[Equation],
                  variables: list[Function],
-                 unknowns: list[Function], 
                  knowns: list[Function],
                  indices: list[Index],
                  depends_on: list['Block']
@@ -168,31 +169,31 @@ class Block:
         self.id = id
         self.equations = equations
         self.variables = variables
-        self.unknowns = unknowns
         self.knowns = knowns
         self.indices = indices
         self.depends_on = depends_on
 
         self.dim = len(self.equations)
-        assert self.dim == len(self.unknowns)
+        assert self.dim == len(self.variables), \
+            f'Block {self.id} has {self.dim} equations, but {len(self.variables)} unknowns'
 
         self.explicit = None
         is_linear = True 
         for eq in self.equations:
-            poly = (eq.lhs - eq.rhs).as_poly(*self.unknowns) # type:ignore
+            poly = (eq.lhs - eq.rhs).as_poly(*self.variables) # type:ignore
             if poly is None or  poly.degree() > 1:
                 is_linear = False
         if is_linear or self.dim == 1:
             sol = sp.solve([eq.lhs - eq.rhs for eq in self.equations],  # type:ignore
-                           self.unknowns, dict=True)
+                           self.variables, dict=True)
             if len(sol) == 1:
-                self.explicit = {v: sol[0][v] for v in self.unknowns}
+                self.explicit = {v: sol[0][v] for v in self.variables}
 
 
         self.jacobian: defaultdict[Equation, dict[Function, Expr]] = defaultdict(dict)
         for eq in self.equations:
             derivatives = {}
-            for v in unknowns:
+            for v in variables:
                 derivative = sp.diff(eq.lhs - eq.rhs, v)
                 if derivative != 0:
                     derivatives[v] = derivative
@@ -218,7 +219,7 @@ class Block:
             code = f'''
             ! ======================== Block {self.id} ========================
             '''
-            for i, v in enumerate(self.unknowns):
+            for i, v in enumerate(self.variables):
                 if v.index:
                     cond = ' .and. '.join(f'{p(i.min)} .lt. {p(value)}' for i, value in v.index.items())
                     previous = [(i, value - 1) for i, value in v.index.items()] # type:ignore
@@ -229,7 +230,6 @@ class Block:
 
             code += f'''
 
-            jac = 0.0d0
 
             do newton_iter = 1, 100
             '''
@@ -249,9 +249,11 @@ class Block:
                 end if
                 if (residual < tol) exit
 
+                jac = 0.0d0
+
                 '''
             for i, eq in enumerate(self.equations):
-                for j, v in enumerate(self.unknowns):
+                for j, v in enumerate(self.variables):
                     if v in self.jacobian[eq]:
                         code += f'''
                 jac({i+1}, {j+1}) = {printer.doprint(self.jacobian[eq][v])}'''
@@ -269,7 +271,7 @@ class Block:
                     return
                 end if
                 '''
-            for i, v in enumerate(self.unknowns):
+            for i, v in enumerate(self.variables):
                 code += f'''
                 {p(v)} = {p(v)} - eq({i+1})'''
             code += f'''
@@ -293,17 +295,15 @@ class Block:
             f'Block #{self.id} {self.indices} <- {tuple(f"#{b.id}" for b in self.depends_on)}\n'\
             f'    equations = {tuple(eq.label for eq in self.equations)}\n'\
             f'    variables = {self.variables}\n'\
-            f'    unknowns  = {self.unknowns}\n'\
             f'    knowns    = {self.knowns}\n'
     
 class Stage:
-    def __init__(self, indices: dict[Index, Expr], inputs: list[Function], blocks: list[Block]):
-        self.indices = indices
+    def __init__(self, inputs: list[Function], blocks: list[Block]):
         self.inputs = inputs
         self.blocks = blocks
 
     def __repr__(self) -> str:
-        s = f'Stage(indices={self.indices}, inputs={self.inputs})):\n'
+        s = f'Stage(inputs={self.inputs})):\n'
         for block in self.blocks:
             s += f'  {block}\n'
         return s
@@ -376,8 +376,6 @@ class Solver:
             # print(eq.label)
             # self.plot_dependencies(dependencies)
 
-        # self.plot_dependencies()
-
         matched: list[Dependency] = []
         matched_eqs: set[Equation] = set()
         matched_unks: set[Function] = set()
@@ -398,16 +396,12 @@ class Solver:
         edges: dict[Node, list[Node]] = defaultdict(list)
         inverse_edges: dict[Node, list[Node]] = defaultdict(list)
 
-        output_indexed: dict[Function, Function] = {}
-
         for dep in dependencies:
             edges[dep.eq].append(dep.var)
             inverse_edges[dep.var].append(dep.eq)
             if dep.matching:
                 edges[dep.var].append(dep.eq)
                 inverse_edges[dep.eq].append(dep.var)
-            output_indexed[dep.var] = dep.var.subs_index(dep.index_mapping)
-
 
         visited: dict[Node, int] = {}
         order = 1
@@ -485,7 +479,6 @@ class Solver:
                 block = Block(block_id, 
                               equations, 
                               variables,
-                              [output_indexed[v] for v in variables],
                               list(knowns), 
                               list(self.indices),
                               depends_on)
@@ -535,61 +528,119 @@ class Solver:
         # for dep in self.dependencies:
             # print(dep)
 
-        index_combinations = tuple(dict(combo) for combo in 
-                                   itertools.product(*[[(i, i.min), (i, i), (i, i.max)] 
-                                   for i in self.indices]))
-        print('Index combinations:', index_combinations)
+        # index_combinations = tuple(dict(combo) for combo in 
+        #                            itertools.product(*[[(i, i.min), (i, i), (i, i.max)] 
+        #                            for i in self.indices]))
+        # print('Index combinations:', index_combinations)
 
         stages: list[Stage] = []
 
-        for index_combo in index_combinations:
-            inputs = set()
-            for v in self.input:
-                if all(index_combo.get(i, None) == mapped 
-                       for i, mapped in v.index_mapping().items()):
-                    inputs.update([v.general_form()])
+        # for index_combo in index_combinations:
+            # inputs = set()
+            # for v in self.input:
+            #     if all(index_combo.get(i, None) == mapped 
+            #            for i, mapped in v.index_mapping().items()):
+            #         inputs.update([v.general_form()])
                     
-            print(f'Input on this combo: {index_combo}, {inputs}')
+            # print(f'Input on this combo: {index_combo}, {inputs}')
 
-            dependencies: list[Dependency] = []
-            for eq in self.equations:
-                unknowns = self.system.dependencies_of(eq) - constants - inputs  #type:ignore
-                for v in unknowns:
-                    dependencies.append(Dependency(eq, v.general_form(), v.index_mapping()))
-                
+        inputs = set()
+        for v in self.input:
+            index = []
+            for i, i_value in v.index.items():
+                if i_value == i.min:
+                    index.append(i)
+                else:
+                    index.append(i_value)
+            inputs.add(v[*index])
+
+        self.dependencies: list[Dependency] = []
+        for eq in self.equations:
+            unknowns = self.system.dependencies_of(eq) - constants - inputs  #type:ignore
+            for v in unknowns:
+                self.dependencies.append(Dependency(v, eq))
+            
+        # for dep in self.dependencies:
+        #     print(dep)
+
+        # Maximum matching ==================================================
+
+        # variable_deps: defaultdict[Function, list[Dependency]] = defaultdict(list)
+        # equation_deps: defaultdict[Equation, list[Dependency]] = defaultdict(list)
+
+        # for dep in self.dependencies:
+        #     variable_deps[dep.var.general_form()].append(dep)
+        #     equation_deps[dep.eq].append(dep)
+
+        # def find_increase_path_from(var: Function, indices: dict[Index, Expr]) -> list[Dependency]:
+        #     if var.subs_index(indices) in self.input:
+        #         return []
+        #     print(f'find_increase_path_from: {var}, {indices}')
+
+        #     # v_eq_matched = False
+        #     for v_dep in variable_deps[var]:
+        #         assert v_dep.var.general_form() == var
+
+        #         if var.index_matches(v_dep.var, list(indices.keys())) is None:
+        #             continue
+
+        #         eq_matching = False
+        #         for eq_dep in equation_deps[v_dep.eq]:
+        #             print(f'  {v_dep}; eq_dep: {eq_dep}, {eq_dep.matching}')
+
+        #             if eq_dep.matching:
+        #                 eq_matching = True
+
+        #         if not eq_matching:
+        #             return [v_dep]
+        #         # if v_dep.matching:
+        #         #     v_eq_matched = True
+
+        #     return [] 
+
+        # for index_combo in index_combinations:
+        #     print(f'Input combo: {index_combo}')
+
+        #     for var in self.variables:
+        #         path = find_increase_path_from(var, index_combo)
+        #         for p in path:
+        #             p.matching = not p.matching
+
+        #         print(f'Path found for {var}: {path}')
+
+        #         if path:
+        #             self.plot_dependencies(self.dependencies)
+
+                    # for dep in self.dependencies:
+                    #     print(dep)
+
+            # # print('match', max_matching)
+        self.maximum_matching(self.dependencies)
+        self.plot_dependencies(self.dependencies)
+
+            # output: set[Function] = set()
             # for dep in dependencies:
-            #     print(dep)
-
-            max_matching, eq_deps, unk_deps = self.maximum_matching(dependencies)
-            # print('match', max_matching)
-            self.plot_dependencies(dependencies)
-
-            output: set[Function] = set()
-            for dep in dependencies:
-                output.update([dep.var.subs_index(dep.index_mapping)])
-            # print('output:', output)
+            #     output.update([dep.var.subs_index(dep.index_mapping)])
+            # # print('output:', output)
             
-            input_in_output = True
-            if index_combo:
-                i = list(index_combo.keys())[0]
-                for v_in in inputs:
-                    if v_in.at(i, i+1) not in output:
-                        input_in_output = False
-                        break
-            # print(input_in_output)
+            # input_in_output = True
+            # if index_combo:
+            #     i = list(index_combo.keys())[0]
+            #     for v_in in inputs:
+            #         if v_in.at(i, i+1) not in output:
+            #             input_in_output = False
+            #             break
+            # # print(input_in_output)
 
-            blocks = self.block_decomposition(dependencies, inputs)
-            # for block in blocks:
-            #     print(block)
+        blocks = self.block_decomposition(self.dependencies, inputs)
+        # for block in blocks:
+        #     print(block)
 
-            stage = Stage(index_combo, list(inputs), blocks)
-            
-            stages.append(stage)
-            # print(stage)
-            self.plot_stage(stage)
-
-            if input_in_output:
-                break
+        stage = Stage(list(inputs), blocks)
+        
+        stages.append(stage)
+        print(stage)
+        self.plot_stage(stage)
 
         # print('Stages:')
         # for stage in stages:
@@ -865,27 +916,33 @@ class Solver:
 
     def plot_dependencies(self, dependencies: list[Dependency]):
         import networkx as nx
-        G = nx.DiGraph()
+        G = nx.MultiDiGraph()
+
         edge_colors = []
         edge_labels = {}
-        for dep in dependencies:
-            u = '$' + dep.eq.label + '$'
-            v = '$' + self.system.latex(dep.var) + '$'
-            G.add_edge(u, v)
-            if dep.matching:
-                edge_colors.append('red')
-            else:
-                edge_colors.append('black')
-            if (u, v) in edge_labels:
-                edge_labels[(u, v)] += f', {dep.index_mapping}'
-            else:
-                edge_labels[(u, v)] = str(dep.index_mapping)
-        left_nodes = {'$' + eq.label + '$' for eq in self.equations}
-        pos = nx.bipartite_layout(G, left_nodes)
+        edge_curves = []
+        unknowns = []
+        for i, dep in enumerate(dependencies):
+            u = '$' + self.system.latex(dep.var) + '$'
+            v = '$' + dep.eq.label + '$'
+            G.add_edge(u, v, key=i, matching=dep.matching)
+            unknowns.append(dep.var)
+            edge_labels[(u, v, i)] = ",".join(str(i) for i in dep.var.index.values())
+            edge_curves.append(0.2 * (i))  # for curved edges
 
-        plt.figure(figsize=(5, 5))
-        nx.draw(G, pos, edge_color=edge_colors, with_labels=True, node_size=2000, node_color='lightblue', font_size=10, font_color='black', arrows=True)
-        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8, label_pos=0.2)
+        for u, v, k, data in G.edges(keys=True, data=True):
+            edge_colors.append('red' if data['matching'] else 'black')
+
+        left_nodes = {'$' + self.system.latex(v) + '$' for v in unknowns}
+
+        plt.figure(figsize=(5, 7))
+        pos = nx.bipartite_layout(G, left_nodes)
+        nx.draw(G, pos, edge_color=edge_colors, with_labels=True,
+                connectionstyle=[f"arc3,rad={curve}" for curve in edge_curves], 
+                node_size=2000, node_color='lightblue', font_size=10, font_color='black')
+
+        # nx.draw_networkx_edge_labels(G, pos, edge_labels, connectionstyle=[f"arc3,rad={curve}" for curve in edge_curves],  font_size=8, label_pos=0.65)
+        # nx.draw_networkx_labels(G, pos)
         plt.title('Dependencies Graph')
         plt.show()
 
@@ -913,6 +970,8 @@ class Solver:
                     x += 1
             xs[block.id] = x
 
+            G.add_node(block.id)
+
             # if set(block.knowns) & set(stage.inputs):
             #     G.add_edge('Input', block.id)
             for depends_on in block.depends_on:
@@ -933,7 +992,7 @@ class Solver:
         pos = {block.id: (xs[block.id] + random.uniform(-1, 1), -orders[block.id]) for block in stage.blocks}
         # pos = nx.spring_layout(G)
 
-        plt.figure(figsize=(5, 5))
+        plt.figure(figsize=(6, 6))
         nx.draw(
             G, pos,
             with_labels=True,
@@ -946,4 +1005,5 @@ class Solver:
 
         plt.title("Block DAG")
         plt.axis('off')
+        plt.margins(0.2)
         plt.show()
