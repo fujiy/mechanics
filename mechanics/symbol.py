@@ -392,3 +392,10 @@ class Equation(spr.Equality):
     def __repr__(self):
         return f'{self._label}: {self.lhs} = {self.rhs}'
     
+    @property
+    def func(self): #type:ignore
+        def make(*args, **options):
+            eq = self.__class__(*args, **options)
+            eq._label = self._label
+            return eq
+        return make

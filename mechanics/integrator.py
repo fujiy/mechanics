@@ -17,10 +17,10 @@ class Integrator(Discretizer):
     X_original: tuple[sp.Expr, ...]
     dX_original: tuple[sp.Expr, ...]
 
-    def __init__(self):
+    def __init__(self, is_explicit: bool = True):
         super().__init__()
 
-        self.is_explicit = False
+        self.is_explicit = is_explicit
         name = self.__class__.__name__
 
     def setup(self, original: System, discretized: DiscretizedSystem,
@@ -74,7 +74,6 @@ class Integrator(Discretizer):
                             name = str(dx_new)
                         self.system.equate(x_new.subs(base), dx_new.subs(base), label=f'State_{{{name}}}', manipulate=False)
 
-
             subs = {}
             for x, x_new, dx, dx_new in zip(self.X, X, self.dX, dX):
                 # if dx in hX:
@@ -89,11 +88,58 @@ class Integrator(Discretizer):
                 # print(f'subs: {x} -> {x_new}, {dx} -> {dx_new}')
 
             for eq in equations:
-                lhs_applied = self.system.discretize_expr(eq.lhs).subs(subs).subs(base)
-                rhs_applied = self.system.discretize_expr(eq.rhs).subs(subs).subs(base)
-        
-                self.system.equate(lhs_applied, rhs_applied, label=f'{{{eq.label}}}_{{{label}}}', manipulate=False)
+                lhs_d = self.system.discretize_expr(eq.lhs)
+                rhs_d = self.system.discretize_expr(eq.rhs)
+                variables = self.system.dependencies_of(lhs_d) | self.system.dependencies_of(rhs_d)
+                if variables & (set(self.dX) - set(self.X)):
+                    lhs_applied = lhs_d.subs(subs).subs(base)
+                    rhs_applied = rhs_d.subs(subs).subs(base)
+                    self.system.equate(lhs_applied, rhs_applied, label=f"{{{eq.label}}}_{{{label}}}", manipulate=False)
+                # diff_n = ''
+                # lhs = eq.lhs
+                # rhs = eq.rhs
+                # while True:
+                #     lhs_dicretized = self.system.discretize_expr(lhs)
+                #     rhs_dicretized = self.system.discretize_expr(rhs)
+                #     variables = self.system.dependencies_of(lhs_dicretized) | self.system.dependencies_of(rhs_dicretized)
+                #     if not variables:
+                #         break
+                #     if variables & (set(self.dX) - set(self.X)):
+                #         lhs_applied = lhs_dicretized.subs(subs).subs(base)
+                #         rhs_applied = rhs_dicretized.subs(subs).subs(base)
 
+                #         self.system.equate(lhs_applied, rhs_applied, label=f"{{{eq.label}}}_{{{label}}}{diff_n}", manipulate=False)
+                #         break
+
+                #     lhs = self.original.diff(lhs, self.space)
+                #     rhs = self.original.diff(rhs, self.space)
+                #     diff_n += "'"
+
+        for eq in equations:
+            diff_n = ''
+            lhs = eq.lhs
+            rhs = eq.rhs
+            while True:
+                lhs_d = self.system.discretize_expr(lhs)
+                rhs_d = self.system.discretize_expr(rhs)
+                variables = self.system.dependencies_of(lhs_d) | self.system.dependencies_of(rhs_d)
+                if not variables:
+                    break
+
+                if self.is_explicit and variables & (set(self.dX) - set(self.X)):
+                    self.system.equate(lhs_d, rhs_d, label=f"{{{eq.label}}}{diff_n}", manipulate=False)
+                    break
+                
+                if not self.is_explicit:
+                    if variables & (set(self.dX) - set(self.X)):
+                        break
+                    self.system.equate(lhs_d, rhs_d, label=f"{{{eq.label}}}{diff_n}", manipulate=False)
+                    break
+
+
+                lhs = self.original.diff(lhs, self.space)
+                rhs = self.original.diff(rhs, self.space)
+                diff_n += "'"
 
         self.step_equations(replace_equation)
 
@@ -112,6 +158,7 @@ class Euler(Integrator):
     step: expr_type
 
     def __init__(self, step):
+        super().__init__()
         self.step = step
         self.name = 'Euler'
 
@@ -138,6 +185,7 @@ class BackwardEuler(Integrator):
     step: expr_type
 
     def __init__(self, step):
+        super().__init__(is_explicit=False)
         self.step = step
         self.name = 'BEuler'
 
@@ -150,7 +198,7 @@ class BackwardEuler(Integrator):
             self.system.add_variable(k_name, index=tuple(dx.index.keys()))
             K.append(self.system[k_name])
 
-        replace_equation(self.X, tuple(K), 'K', self.index + 1)
+        replace_equation(self.X, tuple(K), 'K')
 
         self.index.extend_ghost(1)
 
@@ -164,6 +212,7 @@ class RK2(Integrator):
     step: expr_type
 
     def __init__(self, step):
+        super().__init__()
         self.step = step
         self.name = 'RK2'
 
@@ -198,6 +247,7 @@ class RK4(Integrator):
     step: expr_type
 
     def __init__(self, step):
+        super().__init__()
         self.step = step
         self.name = 'RK4'
 

@@ -3,6 +3,7 @@ from matplotlib.axes import Axes
 
 from mechanics.system import System
 from mechanics.solver import Result
+from mechanics.util import python_name
 
 class ResultAxes(Axes):
     def __init__(self, *args, result: Result, **kwargs):
@@ -25,8 +26,8 @@ class ResultAxes(Axes):
         x = self._result[x_name]
         y = self._result[y_name]
 
-        super().set_xlabel('$' + self._system.latex(x_name) + '$')
-        super().set_ylabel('$' + self._system.latex(y_name) + '$')
+        super().set_xlabel('$' + self._system.latex(python_name(x_name)) + '$')
+        super().set_ylabel('$' + self._system.latex(python_name(y_name)) + '$')
         if x_lim:
             super().set_xlim(*x_lim)
 

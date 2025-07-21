@@ -8,6 +8,7 @@ from sympy.core.cache import cacheit
 import sympy.core.function as spf
 import sympy.core.containers as spc
 from sympy.printing.latex import LatexPrinter
+from sympy.polys.polyerrors import PolynomialError
 import matplotlib.pyplot as plt
 
 from .util import *
@@ -339,6 +340,27 @@ class System:
             if self.dependencies_of(expr) - constants:
                 return False
         return True
+    
+    def is_linear(self, expr: expr_type, 
+                  vars: Union[expr_type, tuple_ish[Function], None] = None) -> bool:
+        exprs = self(expr, return_as_tuple=True, manipulate=False)
+
+        if vars is None:
+            vars = self.coordinates + self.variables
+        else:
+            vars = cast(tuple[Function, ...], self(vars, return_as_tuple=True, manipulate=False))
+        vars_ = set(vars)
+
+        for e in exprs: #type:ignore
+            for v in vars:
+                if isinstance(e, Equation):
+                    dedv = self.diff(e.lhs - e.rhs, v, manipulate=False)
+                else:
+                    dedv = self.diff(e, v, manipulate=False)
+                if self.dependencies_of(dedv) & vars_:
+                    return False
+        return True
+            
 
     # Access
     
@@ -615,21 +637,36 @@ class LagrangeSystem(System):
         super().__init__(space)
 
         
-    def euler_lagrange_equation(self, L: expr_type, time_var='t', label='EL') -> Self:
+    def euler_lagrange_equation(
+            self, L: expr_type, constraints: tuple_ish[name_type]=[], 
+            multiplier: str = r'\lambda',
+            time_var = 't', label = 'EL') -> Self:
         L_ = self(L, evaluate=True, return_as_tuple=False)
-        time_var = self(time_var, return_as_tuple=False)
+        time_var_ = self(time_var, return_as_tuple=False)
+
+        constraint_term = sp.S.Zero
+        constraints_ = self(constraints, return_as_tuple=True, evaluate=False, manipulate=False)
+        for n, c in enumerate(constraints_):
+            if len(constraints_) == 1:
+                multiplier_name = multiplier
+            else:
+                multiplier_name = f'{{{multiplier}}}_{n}'
+
+            self.add_variable(multiplier_name, base_space=time_var, space=R)
+            constraint_term += self[multiplier_name] * (c.lhs - c.rhs)
 
         equations: list[Expr] = []
-
         for q in self.coordinates:
             for q_n in q.enumerate():
                 dLdq = self.diff(L_, q_n)
-                equation = dLdq
+                equation: Expr = dLdq
 
                 for s in self.base_space:
                     dLddq = self.diff(L_, self.diff(q_n, s))
                     d_dLddq_ds = self.diff(dLddq, s)
                     equation -= d_dLddq_ds #type:ignore
+
+                equation -= self.diff(constraint_term, q_n) # type:ignore
 
                 if equation != 0:
                     equations.append(equation)

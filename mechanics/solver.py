@@ -159,7 +159,8 @@ class Dependency:
             return f'{self.var} --> {self.eq.label}'
     
 class Block:
-    def __init__(self, id: int, 
+    def __init__(self, system: System, 
+                 id: int, 
                  equations: list[Equation],
                  variables: list[Function],
                  knowns: list[Function],
@@ -174,20 +175,36 @@ class Block:
         self.depends_on = depends_on
 
         self.dim = len(self.equations)
-        assert self.dim == len(self.variables), \
-            f'Block {self.id} has {self.dim} equations, but {len(self.variables)} unknowns'
+        if self.dim != len(self.variables):
+            self.undetermined = True
+            warnings.warn(f'Block {self.id} has {self.dim} equations, but {len(self.variables)} unknowns')
+        else:
+            self.undetermined = False
+        # assert self.dim == len(self.variables), \
+        #     f'Block {self.id} has {self.dim} equations, but {len(self.variables)} unknowns'
 
         self.explicit = None
         is_linear = True 
+        
         for eq in self.equations:
-            poly = (eq.lhs - eq.rhs).as_poly(*self.variables) # type:ignore
-            if poly is None or  poly.degree() > 1:
+            if not system.is_linear(eq, self.variables):
                 is_linear = False
-        if is_linear or self.dim == 1:
+                break
+
+        if not self.undetermined and (is_linear or self.dim == 1):
+            # print(f'solving {self.id} explicitly')
+            # print(self)
+            # for eq in self.equations:
+            #     display(eq)
             sol = sp.solve([eq.lhs - eq.rhs for eq in self.equations],  # type:ignore
                            self.variables, dict=True)
             if len(sol) == 1:
-                self.explicit = {v: sol[0][v] for v in self.variables}
+                try:
+                    self.explicit = {v: sol[0][v] for v in self.variables}
+                except KeyError as e:
+                    warnings.warn(f'Block {self.id} has no explicit solution for {e}')
+                    self.explicit = None
+            # print('solving explicit:', self.explicit)
 
 
         self.jacobian: defaultdict[Equation, dict[Function, Expr]] = defaultdict(dict)
@@ -330,6 +347,13 @@ class Solver:
             equations[dependency.eq].append(dependency)
             unknowns[dependency.var].append(dependency)
 
+        # if len(equations) != len(unknowns):
+        #     warnings.warn(f'Number of equations ({len(equations)}) does not match number of unknowns ({len(unknowns)})')
+
+        # assert len(equations) == len(unknowns), \
+        #     'Equations seem to be underdetermined or overdetermined: ' \
+        #     f'Number of equations ({len(equations)}) does not match number of unknowns ({len(unknowns)})'
+
         def find_increase_path_from(dep: Dependency, 
                                     searched_eqs: set[Equation] = set(), 
                                     searched_vars: set[Function] = set()) -> list[Dependency]:
@@ -374,7 +398,6 @@ class Solver:
                         p.matching = not p.matching
                     break
             # print(eq.label)
-            # self.plot_dependencies(dependencies)
 
         matched: list[Dependency] = []
         matched_eqs: set[Equation] = set()
@@ -387,7 +410,15 @@ class Solver:
                 matched_eqs.add(dep.eq)
                 matched_unks.add(dep.var)
 
-        assert len(matched) == len(self.equations)
+        self.plot_dependencies(dependencies)
+
+        if len(matched) != len(equations):
+            warnings.warn(f'Not all equations are matched: {set(equations) - matched_eqs} equations')
+        if len(matched) != len(unknowns):
+            warnings.warn(f'Not all unknowns are matched: {set(unknowns) - matched_unks} unknowns')
+        
+        # assert len(matched) == len(equations) == len(unknowns), \
+        #     f'Equation {set(equations) - matched_eqs} and {set(unknowns) - matched_unks} is not matched'
 
         return matched, equations, unknowns
 
@@ -410,7 +441,6 @@ class Solver:
         # print('Inverse edges:', inverse_edges)
 
         def first_dfs(node: Node):
-
             nonlocal order
             if node in visited:
                 if visited[node] == 0:
@@ -468,7 +498,7 @@ class Solver:
                 variables: list[Function] = []
                 knowns: set[Function] = inputs.copy()
                 for node in nodes:
-                    if node in self.equations:
+                    if isinstance(node, Equation):
                         equations.append(cast(Equation, node))
                         knowns |= set(cast(list[Function], edges.get(node, [])))
                     else:
@@ -476,7 +506,8 @@ class Solver:
                         variables.append(cast(Function, node))
                 knowns = knowns - set(variables)
                 depends_on = [ block for block in blocks if set(block.variables) & knowns]
-                block = Block(block_id, 
+                block = Block(self.system,
+                              block_id, 
                               equations, 
                               variables,
                               list(knowns), 
@@ -525,9 +556,6 @@ class Solver:
             self.equations.update([cast(Equation, equation)]) 
             # self.unknowns.update(unknowns)
 
-        # for dep in self.dependencies:
-            # print(dep)
-
         # index_combinations = tuple(dict(combo) for combo in 
         #                            itertools.product(*[[(i, i.min), (i, i), (i, i.max)] 
         #                            for i in self.indices]))
@@ -554,11 +582,50 @@ class Solver:
                     index.append(i_value)
             inputs.add(v[*index])
 
+        index_range_all: defaultdict[Index, set[Expr]] = defaultdict(set)
+        for eq in self.equations:
+            for var in self.system.dependencies_of(eq):
+                for i, i_value in var.index.items():
+                    index_range_all[i].add(i_value - i)
+
+        print(index_range_all)
+
         self.dependencies: list[Dependency] = []
         for eq in self.equations:
-            unknowns = self.system.dependencies_of(eq) - constants - inputs  #type:ignore
-            for v in unknowns:
-                self.dependencies.append(Dependency(v, eq))
+            variables = self.system.dependencies_of(eq)
+            index_range = defaultdict(set)
+            for var in self.system.dependencies_of(eq):
+                for i, i_value in var.index.items():
+                    index_range[i].add(i_value - i)
+
+            unknowns = self.system.dependencies_of(eq) - constants  #type:ignore
+
+            patterns = { i: index_range_all[i] - index_range[i] | {0} for i in index_range.keys()}
+
+            index_offsets = itertools.product(*[list(offsets) for offsets in patterns.values()])
+            for index_offset in index_offsets:
+                index_subs = [(i, i + offset) for i, offset in zip(index_range.keys(), index_offset)]
+                # print(f'Index subs for {eq.label}: {list(index_subs)}')
+                eq_offset = cast(Equation, eq.subs(index_subs))
+                if eq != eq_offset:
+                    offset_label = str(",".join(str(i) for i in dict(index_subs).values()))
+                    eq_offset._label = f'{eq.label} {offset_label}'
+                # print(f'Equation: {eq_offset.label}, {eq_offset}')
+                # if python_name(eq_offset._label) in ['State_k_doty', 'State_k_dotx']:
+                #     continue
+                added = False
+                for v in unknowns:
+                    v_offset = cast(Function, v.subs(index_subs))
+                    if v_offset in inputs:
+                        continue
+                    self.dependencies.append(Dependency(v_offset, eq_offset))
+                    added = True
+                if added:
+                    self.system.show(eq_offset, label=eq_offset.label)
+                    pass
+                    # print(self.system.latex(eq_offset))
+
+
             
         # for dep in self.dependencies:
         #     print(dep)
@@ -616,7 +683,6 @@ class Solver:
 
             # # print('match', max_matching)
         self.maximum_matching(self.dependencies)
-        self.plot_dependencies(self.dependencies)
 
             # output: set[Function] = set()
             # for dep in dependencies:
@@ -633,10 +699,69 @@ class Solver:
             # # print(input_in_output)
 
         blocks = self.block_decomposition(self.dependencies, inputs)
+        block_is_depended_on = defaultdict(set)
+
+        used_blocks: list[Block] = []
+        for block in reversed(blocks):
+            used = False
+            if block.id in block_is_depended_on:
+                used = True
+            for v in block.variables:
+                if any(i == i_value for i, i_value in v.index.items()):
+                    used = True
+                if v.general_form() in inputs:
+                    used = True
+                if used:
+                    break
+            if used:
+                for dep_block in block.depends_on:
+                    block_is_depended_on[dep_block.id].add(block)
+                used_blocks.append(block) 
+            else:
+                # print(f'Block {block.id} is not used, removing it')
+                pass
+                # print(block)
+
+        used_blocks.reverse()
+
+        first_indices: defaultdict[Function, dict[Index, Expr]] = defaultdict(dict)
+
+        for block in used_blocks:
+            for v in block.variables:
+                firsts = first_indices[v.general_form()]
+                for i, i_value in v.index.items():
+                    if i in firsts:
+                        if i_value - firsts[i] > 0:
+                            firsts[i] = i_value
+                    else:
+                        firsts[i] = i_value
+
+        print('First indices:', first_indices)
+
+        first_blocks: list[Block] = []
+        for block in used_blocks:
+            is_first_block = False
+            for v in block.variables:
+                first = first_indices[v.general_form()]
+                if any(i_value == first[i] for i, i_value in v.index.items()):
+                    is_first_block = True
+                    print(f'Block {block.id} is first, indices: {v.index}, firsts: {first}')
+                    break
+
+            if is_first_block:
+                first_blocks.append(block)
+            else:
+                print(f'Block {block.id} is not first, removing it')
+                # blocks.remove(block)
+
+        for block in first_blocks:
+            if block.undetermined:
+                warnings.warn(f'Block {block.id} is undetermined')
+                
         # for block in blocks:
         #     print(block)
 
-        stage = Stage(list(inputs), blocks)
+        stage = Stage(list(inputs), list(first_blocks))
         
         stages.append(stage)
         print(stage)
@@ -935,7 +1060,7 @@ class Solver:
 
         left_nodes = {'$' + self.system.latex(v) + '$' for v in unknowns}
 
-        plt.figure(figsize=(5, 7))
+        plt.figure(figsize=(5, len(left_nodes) * 0.8))
         pos = nx.bipartite_layout(G, left_nodes)
         nx.draw(G, pos, edge_color=edge_colors, with_labels=True,
                 connectionstyle=[f"arc3,rad={curve}" for curve in edge_curves], 
