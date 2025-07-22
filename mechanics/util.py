@@ -60,6 +60,8 @@ def python_name(name: name_type) -> str:
         name = 'lambda_'
     return name
 
+def is_tuple_ish(items: tuple_ish[T]) -> bool:
+    return isinstance(items, (tuple, list))
 
 def to_tuple(items: tuple_ish[T]) -> tuple[T, ...]:
     if isinstance(items, tuple):

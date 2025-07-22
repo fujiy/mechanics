@@ -1,14 +1,14 @@
 import datetime
 import itertools
 import time
-from typing import cast, Any, Optional
+from typing import Iterable, cast, Any, Optional
 from collections import defaultdict
 import tempfile
 import os
 import importlib
 import importlib.resources
 import importlib.util
-import shutil
+import shortuuid
 import sys
 import subprocess
 import textwrap
@@ -24,7 +24,7 @@ from sympy.printing.numpy import SciPyPrinter
 
 from mechanics.system import System
 from mechanics.symbol import Function, Expr, Index, Equation, Union
-from mechanics.util import python_name, name_type, tuple_ish, to_tuple, generate_prefixes
+from mechanics.util import is_tuple_ish, python_name, name_type, tuple_ish, to_tuple, generate_prefixes
 from mechanics.space import Z
 
 class PythonPrinter(SciPyPrinter):
@@ -97,13 +97,14 @@ class Result:
         self.system = system
 
         self.newton_converged_iters = []
-        self._dict = {}
+        self._dict: dict[str, Any] = {}
+        self._builtins = { k: getattr(np, k) for k in dir(np) if not k.startswith('_') }\
 
         if not directory:
             directory = os.path.join(os.getcwd(), 'result')
         if not name:
             now = datetime.datetime.now()
-            name = now.strftime('%Y%m%d_%H%M%S')
+            name = now.strftime('%Y%m%d_%H%M%S_') + shortuuid.ShortUUID().random(length=6)
            
         self.path = os.path.join(directory, name, '')
             
@@ -125,6 +126,10 @@ class Result:
             self.set_data(key, value)
 
     # Access
+
+    def __call__(self, expr: str) -> Any:
+        data = eval(expr, globals() | self._builtins, self._dict)
+        return data
     
     def __getattr__(self, name: str) -> np.ndarray:
         if name in self._dict: return self._dict[name]
@@ -139,11 +144,48 @@ class Result:
         name = python_name(name)
         return name in self._dict
     
+    def latex(self, expr: str) -> str:
+        return self.system.latex(expr)
+    
     # For plotting
     def _as_mpl_axes(self) -> Any:
         from mechanics.plot import ResultAxes
         return ResultAxes, { 'result': self } 
         
+class Results:
+    def __init__(self, results: Iterable[Result] = []):
+        self.results: list[Result] = []
+        self._builtins = { k: getattr(np, k) for k in dir(np) if not k.startswith('_') }
+        self._dict: dict[str, list[Any]] = {}
+        for result in results:
+            self.append(result)
+
+    def append(self, result: Result):
+        for key, value in result._dict.items():
+            if key not in self._dict:
+                self._dict[key] = [None] * len(self.results)
+            self._dict[key].append(value)
+        self.results.append(result)
+
+    def __getitem__(self, index: int) -> Result:
+        return self.results[index]
+    
+    def __call__(self, expr: str) -> Any:
+        data = eval(expr, globals() | self._builtins, self._dict)
+        return data
+    
+    # For plotting
+    def _as_mpl_axes(self) -> Any:
+        from mechanics.plot import ResultsAxes
+        return ResultsAxes, { 'results': self } 
+    
+    def latex(self, expr: str) -> str:
+        for result in self.results:
+            try:
+                return result.latex(expr)
+            except KeyError:
+                continue
+        raise KeyError(f'\'{expr}\' is not exists in any results')
 
 class Dependency:
 
@@ -177,7 +219,7 @@ class Block:
         self.dim = len(self.equations)
         if self.dim != len(self.variables):
             self.undetermined = True
-            warnings.warn(f'Block {self.id} has {self.dim} equations, but {len(self.variables)} unknowns')
+            # warnings.warn(f'Block {self.id} has {self.dim} equations, but {len(self.variables)} unknowns')
         else:
             self.undetermined = False
         # assert self.dim == len(self.variables), \
@@ -191,7 +233,8 @@ class Block:
                 is_linear = False
                 break
 
-        if not self.undetermined and (is_linear or self.dim == 1):
+        # if not self.undetermined and (is_linear or self.dim == 1):
+        if not self.undetermined and (self.dim == 1):
             # print(f'solving {self.id} explicitly')
             # print(self)
             # for eq in self.equations:
@@ -412,10 +455,10 @@ class Solver:
 
         self.plot_dependencies(dependencies)
 
-        if len(matched) != len(equations):
-            warnings.warn(f'Not all equations are matched: {set(equations) - matched_eqs} equations')
-        if len(matched) != len(unknowns):
-            warnings.warn(f'Not all unknowns are matched: {set(unknowns) - matched_unks} unknowns')
+        # if len(matched) != len(equations):
+        #     warnings.warn(f'Not all equations are matched: {set(equations) - matched_eqs} equations')
+        # if len(matched) != len(unknowns):
+        #     warnings.warn(f'Not all unknowns are matched: {set(unknowns) - matched_unks} unknowns')
         
         # assert len(matched) == len(equations) == len(unknowns), \
         #     f'Equation {set(equations) - matched_eqs} and {set(unknowns) - matched_unks} is not matched'
@@ -588,7 +631,7 @@ class Solver:
                 for i, i_value in var.index.items():
                     index_range_all[i].add(i_value - i)
 
-        print(index_range_all)
+        # print(index_range_all)
 
         self.dependencies: list[Dependency] = []
         for eq in self.equations:
@@ -621,7 +664,7 @@ class Solver:
                     self.dependencies.append(Dependency(v_offset, eq_offset))
                     added = True
                 if added:
-                    self.system.show(eq_offset, label=eq_offset.label)
+                    # self.system.show(eq_offset, label=eq_offset.label)
                     pass
                     # print(self.system.latex(eq_offset))
 
@@ -701,7 +744,7 @@ class Solver:
         blocks = self.block_decomposition(self.dependencies, inputs)
         block_is_depended_on = defaultdict(set)
 
-        used_blocks: list[Block] = []
+        unused_blocks: set[Block] = set()
         for block in reversed(blocks):
             used = False
             if block.id in block_is_depended_on:
@@ -716,52 +759,87 @@ class Solver:
             if used:
                 for dep_block in block.depends_on:
                     block_is_depended_on[dep_block.id].add(block)
-                used_blocks.append(block) 
             else:
                 # print(f'Block {block.id} is not used, removing it')
                 pass
+                unused_blocks.add(block) 
                 # print(block)
 
-        used_blocks.reverse()
+        blocks = [block for block in blocks if block not in unused_blocks and not block.undetermined]
 
-        first_indices: defaultdict[Function, dict[Index, Expr]] = defaultdict(dict)
+        orphan_blocks: set[Block] = set()
+        while True:
+            changed = False
+            for block in blocks:
+                if any(dep_block not in blocks for dep_block in block.depends_on):
+                    orphan_blocks.add(block)
+                    # print(f'Block {block.id} is orphan, removing it')
+                    changed = True
+            if changed:
+                blocks = [block for block in blocks if block not in orphan_blocks]
+            else:   
+                break 
 
-        for block in used_blocks:
+        determined_variables: set[Function] = set()
+        for block in blocks:
             for v in block.variables:
-                firsts = first_indices[v.general_form()]
-                for i, i_value in v.index.items():
-                    if i in firsts:
-                        if i_value - firsts[i] > 0:
-                            firsts[i] = i_value
-                    else:
-                        firsts[i] = i_value
+                determined_variables.add(v.general_form())
+                
+        nondetermined_variables = set(self.variables) - determined_variables
+        if nondetermined_variables:
+            raise ValueError(f'Not all variables are determined: {nondetermined_variables}')
 
-        print('First indices:', first_indices)
+        # first_indices: defaultdict[Function, dict[Index, Expr]] = defaultdict(dict)
 
-        first_blocks: list[Block] = []
-        for block in used_blocks:
-            is_first_block = False
-            for v in block.variables:
-                first = first_indices[v.general_form()]
-                if any(i_value == first[i] for i, i_value in v.index.items()):
-                    is_first_block = True
-                    print(f'Block {block.id} is first, indices: {v.index}, firsts: {first}')
-                    break
+        # for block in blocks:
+        #     for v in block.variables:
+        #         firsts = first_indices[v.general_form()]
+        #         for i, i_value in v.index.items():
+        #             if i in firsts:
+        #                 if i_value - firsts[i] > 0:
+        #                     firsts[i] = i_value
+        #             else:
+        #                 firsts[i] = i_value
 
-            if is_first_block:
-                first_blocks.append(block)
-            else:
-                print(f'Block {block.id} is not first, removing it')
-                # blocks.remove(block)
+        # print('First indices:', first_indices)
 
-        for block in first_blocks:
-            if block.undetermined:
-                warnings.warn(f'Block {block.id} is undetermined')
+        # first_blocks: set[Block] = set()
+        # for block in blocks:
+        #     is_first_block = False
+        #     for v in block.variables:
+        #         first = first_indices[v.general_form()]
+        #         if any(i_value == first[i] for i, i_value in v.index.items()):
+        #             is_first_block = True
+        #             # print(f'Block {block.id} is first, indices: {v.index}, firsts: {first}')
+        #             break
+
+        #     if is_first_block:
+        #         first_blocks.add(block)
+        #     else:
+        #         print(f'Block {block.id} is not first, removing it')
+        #         # blocks.remove(block)
+
+        # changed = True
+        # while changed:
+        #     changed = False
+        #     for block in blocks:
+        #         if block not in first_blocks:
+        #             if any(block in first_block.depends_on for first_block in first_blocks):
+        #                 print(f'Block {block.id} is not first, but depends on first blocks')
+        #                 first_blocks.add(block)
+        #                 changed = True
+        #                 # blocks.remove(block)
+
+        # for block in first_blocks:
+        #     if block.undetermined:
+        #         warnings.warn(f'Block {block.id} is undetermined')
+
+        # blocks = [block for block in blocks if block in blocks]
                 
         # for block in blocks:
         #     print(block)
 
-        stage = Stage(list(inputs), list(first_blocks))
+        stage = Stage(list(inputs), blocks)
         
         stages.append(stage)
         print(stage)

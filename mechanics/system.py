@@ -554,7 +554,7 @@ class System:
         if label:
             message += label
         elif label_str:
-            message += r'\mathrm{' + label_str + '}'
+            message += r'\text{' + label_str + '}'
         if (label or label_str) and expr is not None:
             message += ':'
         if expr is not None:
