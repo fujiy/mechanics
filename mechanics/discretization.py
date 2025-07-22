@@ -43,6 +43,9 @@ class DiscretizedSystem(System):
         self._discretized_spaces = { space_ : index_ }
         self._discretized_diffs[space_] = {}
 
+        if isinstance(step, str) and step not in self:
+            self.add_constant(step, space=space_)
+
         self.define(space_.name, self(step, manipulate=False, return_as_tuple=False) * index_, manipulate=False) #type: ignore
 
         return self
@@ -80,7 +83,11 @@ class DiscretizedSystem(System):
                 # self.__replace_diff(q, (space_, 1))
                 # self.__replace_diff(q, (space_, 2))
 
-        for v in self._original._functions:
+        for c in self._original.constants:
+            new_index, new_base_space = self.__discretized_args(c)
+            self.add_constant(c.name, index=new_index, space=c.space)
+
+        for v in self._original.variables:
             new_index, new_base_space = self.__discretized_args(v)
             self.add_variable(v.name, index=new_index, base_space=new_base_space, space=v.space)
 
@@ -88,23 +95,11 @@ class DiscretizedSystem(System):
             self.define(name, cast(sp.Expr, self.discretize_expr(definition)), manipulate=False)
 
         for discretizer, options in self._discretizers:
-            discretizer.setup(self._original, self, **options)
-
+            discretizer.setup(self._original, self, **options)            
+        
         for discretizer, options in self._discretizers:
             discretizer.apply_to_equations(tuple(self._original._equations.values()))
-        if not self._discretizers:
-            for eq in self._original._equations.values():
-                self.equate(self.discretize_expr(cast(sp.Expr, eq.lhs)), 
-                            self.discretize_expr(cast(sp.Expr, eq.rhs)), 
-                            label=eq.label,
-                            manipulate=False)
-            
-            # if applied: break
-            # if not applied:
-            #     self.equate(self.discretize_single_expr(cast(sp.Expr, eq.lhs)), 
-            #                 self.discretize_expr(cast(sp.Expr, eq.rhs)), 
-            #                 label=eq.label)
-        
+                    
         return self
 
     def primary_index(self) -> Optional[Index]:

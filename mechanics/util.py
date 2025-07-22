@@ -1,6 +1,8 @@
 import sympy as sp
 from typing import Union, TypeVar
 from numbers import Number
+from itertools import product, count
+import string
 
 T = TypeVar('T')
 
@@ -58,6 +60,9 @@ def python_name(name: name_type) -> str:
         name = 'lambda_'
     return name
 
+def is_tuple_ish(items: tuple_ish[T]) -> bool:
+    return isinstance(items, (tuple, list))
+
 def to_tuple(items: tuple_ish[T]) -> tuple[T, ...]:
     if isinstance(items, tuple):
         return items
@@ -86,3 +91,11 @@ def to_single_or_tuple(items: tuple_ish[T], return_as_tuple=None) -> single_or_t
             return result[0]
         else:
             raise ValueError(f'Expected a single expression, got {len(result)}: {result}')
+        
+def generate_prefixes():
+    """a, b, ..., z, aa, ab, ..., zz, aaa, ..."""
+
+    letters = string.ascii_uppercase
+    for n in count(1):  # prefix length
+        for comb in product(letters, repeat=n):
+            yield ''.join(comb)

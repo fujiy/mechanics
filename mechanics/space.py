@@ -4,20 +4,31 @@ import sympy as sp
 class Space(sp.Symbol):
     pass
 
-class Real(sp.Symbol):
-    def __new__(cls):
+class IntegerSpace(sp.Symbol):
+    def __new__(cls, dim: int = 1):
+        if dim != 1:
+            return super().__new__(cls, fr'\mathbb{{Z}}^{{{dim}}}')
+        return super().__new__(cls, r'\mathbb{Z}')
+
+class RealSpace(sp.Symbol):
+    def __new__(cls, dim: int = 1):
+        if dim != 1:
+            return super().__new__(cls, fr'\mathbb{{R}}^{{{dim}}}')
         return super().__new__(cls, r'\mathbb{R}')
 
-class Sphere(sp.Symbol):
-    def __new__(cls):
+class SphereSpace(sp.Symbol):
+    def __new__(cls, dim: int = 1):
+        if dim != 1:
+            return super().__new__(cls, f'S^{{{dim}}}')
         return super().__new__(cls, 'S')
 
-class Rotation(sp.Symbol):
+class RotationSpace(sp.Symbol):
     def __new__(cls, dim: int):
         if dim not in (2, 3):
             raise ValueError(f'Rotation space only defined for n=2 or n=3, not {dim}')
         return super().__new__(cls, f'SO({dim})')
 
-R = Real()
-S = Sphere()
-SO = Rotation
+Z = IntegerSpace()
+R = RealSpace()
+S = SphereSpace()
+SO = RotationSpace

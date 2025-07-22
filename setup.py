@@ -11,5 +11,9 @@ setup(
         'numpy',
         'sympy',
         'matplotlib',
+        'shortuuid'
     ],
+    package_data={
+        'mechanics': ['mechanics/fortran/*.f90'],
+    },
 )
