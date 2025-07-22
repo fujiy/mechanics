@@ -12,7 +12,7 @@ import shortuuid
 import sys
 import subprocess
 import textwrap
-import warnings
+from logging import getLogger, DEBUG
 import numpy as np
 from scipy import linalg
 from scipy import sparse
@@ -26,6 +26,8 @@ from mechanics.system import System
 from mechanics.symbol import Function, Expr, Index, Equation, Union
 from mechanics.util import is_tuple_ish, python_name, name_type, tuple_ish, to_tuple, generate_prefixes
 from mechanics.space import Z
+
+logger = getLogger(__name__)
 
 class PythonPrinter(SciPyPrinter):
     # def _print_Symbol(self, expr):
@@ -109,6 +111,11 @@ class Result:
         self.path = os.path.join(directory, name, '')
             
         os.makedirs(self.path, exist_ok=True)
+
+    def __del__(self):
+        for key, value in self._dict.items():
+            if isinstance(value, np.memmap):
+                value._mmap.close() #type:ignore
 
     def set_data(self, key: Any, value: Any):
         if isinstance(key, str):
@@ -219,7 +226,7 @@ class Block:
         self.dim = len(self.equations)
         if self.dim != len(self.variables):
             self.undetermined = True
-            # warnings.warn(f'Block {self.id} has {self.dim} equations, but {len(self.variables)} unknowns')
+            logger.info(f'Block {self.id} has {self.dim} equations, but {len(self.variables)} unknowns')
         else:
             self.undetermined = False
         # assert self.dim == len(self.variables), \
@@ -245,7 +252,7 @@ class Block:
                 try:
                     self.explicit = {v: sol[0][v] for v in self.variables}
                 except KeyError as e:
-                    warnings.warn(f'Block {self.id} has no explicit solution for {e}')
+                    logger.info(f'Block {self.id} has no explicit solution for {e}')
                     self.explicit = None
             # print('solving explicit:', self.explicit)
 
@@ -453,7 +460,8 @@ class Solver:
                 matched_eqs.add(dep.eq)
                 matched_unks.add(dep.var)
 
-        self.plot_dependencies(dependencies)
+        if logger.isEnabledFor(DEBUG):
+            self.plot_dependencies(dependencies)
 
         # if len(matched) != len(equations):
         #     warnings.warn(f'Not all equations are matched: {set(equations) - matched_eqs} equations')
@@ -571,7 +579,7 @@ class Solver:
         self.coordinates = system.coordinates
         self.variables = system.coordinates + system.variables
 
-        print(f'Indices: {self.indices}')
+        logger.info(f'Indices: {self.indices}')
 
         self.index_margin = 10
 
@@ -587,7 +595,7 @@ class Solver:
         else:
             self.input = to_tuple(input)
 
-        print(f'Input: {self.input}')
+        logger.info(f'Input: {self.input}')
 
         constants = set(self.constants)
 
@@ -598,22 +606,6 @@ class Solver:
             equation = self.system.eval(eq)
             self.equations.update([cast(Equation, equation)]) 
             # self.unknowns.update(unknowns)
-
-        # index_combinations = tuple(dict(combo) for combo in 
-        #                            itertools.product(*[[(i, i.min), (i, i), (i, i.max)] 
-        #                            for i in self.indices]))
-        # print('Index combinations:', index_combinations)
-
-        stages: list[Stage] = []
-
-        # for index_combo in index_combinations:
-            # inputs = set()
-            # for v in self.input:
-            #     if all(index_combo.get(i, None) == mapped 
-            #            for i, mapped in v.index_mapping().items()):
-            #         inputs.update([v.general_form()])
-                    
-            # print(f'Input on this combo: {index_combo}, {inputs}')
 
         inputs = set()
         for v in self.input:
@@ -668,78 +660,7 @@ class Solver:
                     pass
                     # print(self.system.latex(eq_offset))
 
-
-            
-        # for dep in self.dependencies:
-        #     print(dep)
-
-        # Maximum matching ==================================================
-
-        # variable_deps: defaultdict[Function, list[Dependency]] = defaultdict(list)
-        # equation_deps: defaultdict[Equation, list[Dependency]] = defaultdict(list)
-
-        # for dep in self.dependencies:
-        #     variable_deps[dep.var.general_form()].append(dep)
-        #     equation_deps[dep.eq].append(dep)
-
-        # def find_increase_path_from(var: Function, indices: dict[Index, Expr]) -> list[Dependency]:
-        #     if var.subs_index(indices) in self.input:
-        #         return []
-        #     print(f'find_increase_path_from: {var}, {indices}')
-
-        #     # v_eq_matched = False
-        #     for v_dep in variable_deps[var]:
-        #         assert v_dep.var.general_form() == var
-
-        #         if var.index_matches(v_dep.var, list(indices.keys())) is None:
-        #             continue
-
-        #         eq_matching = False
-        #         for eq_dep in equation_deps[v_dep.eq]:
-        #             print(f'  {v_dep}; eq_dep: {eq_dep}, {eq_dep.matching}')
-
-        #             if eq_dep.matching:
-        #                 eq_matching = True
-
-        #         if not eq_matching:
-        #             return [v_dep]
-        #         # if v_dep.matching:
-        #         #     v_eq_matched = True
-
-        #     return [] 
-
-        # for index_combo in index_combinations:
-        #     print(f'Input combo: {index_combo}')
-
-        #     for var in self.variables:
-        #         path = find_increase_path_from(var, index_combo)
-        #         for p in path:
-        #             p.matching = not p.matching
-
-        #         print(f'Path found for {var}: {path}')
-
-        #         if path:
-        #             self.plot_dependencies(self.dependencies)
-
-                    # for dep in self.dependencies:
-                    #     print(dep)
-
-            # # print('match', max_matching)
         self.maximum_matching(self.dependencies)
-
-            # output: set[Function] = set()
-            # for dep in dependencies:
-            #     output.update([dep.var.subs_index(dep.index_mapping)])
-            # # print('output:', output)
-            
-            # input_in_output = True
-            # if index_combo:
-            #     i = list(index_combo.keys())[0]
-            #     for v_in in inputs:
-            #         if v_in.at(i, i+1) not in output:
-            #             input_in_output = False
-            #             break
-            # # print(input_in_output)
 
         blocks = self.block_decomposition(self.dependencies, inputs)
         block_is_depended_on = defaultdict(set)
@@ -789,65 +710,18 @@ class Solver:
         if nondetermined_variables:
             raise ValueError(f'Not all variables are determined: {nondetermined_variables}')
 
-        # first_indices: defaultdict[Function, dict[Index, Expr]] = defaultdict(dict)
 
-        # for block in blocks:
-        #     for v in block.variables:
-        #         firsts = first_indices[v.general_form()]
-        #         for i, i_value in v.index.items():
-        #             if i in firsts:
-        #                 if i_value - firsts[i] > 0:
-        #                     firsts[i] = i_value
-        #             else:
-        #                 firsts[i] = i_value
 
-        # print('First indices:', first_indices)
-
-        # first_blocks: set[Block] = set()
-        # for block in blocks:
-        #     is_first_block = False
-        #     for v in block.variables:
-        #         first = first_indices[v.general_form()]
-        #         if any(i_value == first[i] for i, i_value in v.index.items()):
-        #             is_first_block = True
-        #             # print(f'Block {block.id} is first, indices: {v.index}, firsts: {first}')
-        #             break
-
-        #     if is_first_block:
-        #         first_blocks.add(block)
-        #     else:
-        #         print(f'Block {block.id} is not first, removing it')
-        #         # blocks.remove(block)
-
-        # changed = True
-        # while changed:
-        #     changed = False
-        #     for block in blocks:
-        #         if block not in first_blocks:
-        #             if any(block in first_block.depends_on for first_block in first_blocks):
-        #                 print(f'Block {block.id} is not first, but depends on first blocks')
-        #                 first_blocks.add(block)
-        #                 changed = True
-        #                 # blocks.remove(block)
-
-        # for block in first_blocks:
-        #     if block.undetermined:
-        #         warnings.warn(f'Block {block.id} is undetermined')
-
-        # blocks = [block for block in blocks if block in blocks]
-                
-        # for block in blocks:
-        #     print(block)
+        stages: list[Stage] = []
 
         stage = Stage(list(inputs), blocks)
         
         stages.append(stage)
-        print(stage)
-        self.plot_stage(stage)
-
-        # print('Stages:')
-        # for stage in stages:
-        #     print(stage)
+        logger.debug(str(stage))
+        # print(stage)
+        if logger.isEnabledFor(DEBUG):
+            for stage in stages:
+                self.plot_stage(stage)
 
         printer = FortranPrinter({'source_format': 'free', 'strict': False, 'standard': 95, 'precision': 15})
         p = printer.doprint
@@ -1072,7 +946,7 @@ class Solver:
 
         with open(generate_path, 'w') as f:
             f.write(source)
-        print(generate_path)
+        print(f'Generating Fortran code in {generate_path}')
 
         lib_files = [str(importlib.resources.files('mechanics').joinpath(f'fortran/{filename}'))
             for filename in libs]
@@ -1105,17 +979,6 @@ class Solver:
         spec.loader.exec_module(module)
 
         return module
-
-                
-    def print_jacobian(self):
-        J: list[list[Expr]] = []
-        for i, label in enumerate(self.equations):
-            J_i = []
-            for j, var in enumerate(self.unknowns):
-                J_i.append(self.jacobian.get(label, {}).get(var, 0))
-            J.append(J_i)
-        
-        self.system.show(sp.Matrix(J), label_str='Jacobian') #type:ignore
 
     def plot_dependencies(self, dependencies: list[Dependency]):
         import networkx as nx
