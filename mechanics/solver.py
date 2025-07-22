@@ -226,7 +226,7 @@ class Block:
         self.dim = len(self.equations)
         if self.dim != len(self.variables):
             self.undetermined = True
-            logger.info(f'Block {self.id} has {self.dim} equations, but {len(self.variables)} unknowns')
+            logger.debug(f'Block {self.id} has {self.dim} equations, but {len(self.variables)} unknowns')
         else:
             self.undetermined = False
         # assert self.dim == len(self.variables), \
@@ -344,7 +344,7 @@ class Block:
             code += f'''
             end do
             if (residual >= tol) then
-                write(message, '("Block {self.id} not converging: ", E10.4, {",".join([f'" {i.name} =", i5' for i in indices])})') residual, {', '.join([f"{p(i)}" for i in indices])}
+                write(message, '("Block {self.id} not converging: ", E10.4 {"".join([f', " {i.name} =", i5' for i in indices])})') residual {''.join([f", {p(i)}" for i in indices])}
                 status = 1
                 call flush(6)
                 return
@@ -671,6 +671,8 @@ class Solver:
             if block.id in block_is_depended_on:
                 used = True
             for v in block.variables:
+                if not v.index:
+                    used = True
                 if any(i == i_value for i, i_value in v.index.items()):
                     used = True
                 if v.general_form() in inputs:
@@ -681,7 +683,7 @@ class Solver:
                 for dep_block in block.depends_on:
                     block_is_depended_on[dep_block.id].add(block)
             else:
-                # print(f'Block {block.id} is not used, removing it')
+                logger.debug(f'Block {block.id} is not used, removing it')
                 pass
                 unused_blocks.add(block) 
                 # print(block)
@@ -694,7 +696,7 @@ class Solver:
             for block in blocks:
                 if any(dep_block not in blocks for dep_block in block.depends_on):
                     orphan_blocks.add(block)
-                    # print(f'Block {block.id} is orphan, removing it')
+                    logger.debug(f'Block {block.id} is orphan, removing it')
                     changed = True
             if changed:
                 blocks = [block for block in blocks if block not in orphan_blocks]
@@ -705,12 +707,14 @@ class Solver:
         for block in blocks:
             for v in block.variables:
                 determined_variables.add(v.general_form())
+
+        # for block in blocks:
+        #     logger.debug(f'Block {block.id} ({len(block.equations)} equations, {len(block.variables)} variables, {len(block.knowns)} knowns):')
+        #     logger.debug(str(block))
                 
         nondetermined_variables = set(self.variables) - determined_variables
         if nondetermined_variables:
             raise ValueError(f'Not all variables are determined: {nondetermined_variables}')
-
-
 
         stages: list[Stage] = []
 
@@ -753,7 +757,7 @@ class Solver:
             external dnrm2
 
             character(len=*), intent(in) :: log_path
-            real(8), dimension({condition_dim}), intent(in) :: condition
+            real(8), dimension(:), intent(in) :: condition
             integer, intent(out) :: status
             character(len=100), intent(out) :: message
 
@@ -910,6 +914,8 @@ class Solver:
             + [  condition_[v] for v in self.input ])
 
         result = Result(self.system, directory=directory, name=name)
+
+        print(condition_values)
 
         status, message = self.module.run_solver(result.path, condition_values)
         if status != 0:
